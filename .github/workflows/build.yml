@@ -1,63 +1,60 @@
 name: Build
 
-# https://docs.github.com/en/actions/learn-github-actions/workflow-syntax-for-github-actions#concurrency
-concurrency: 
-  group: "build"
-  cancel-in-progress: true
-
 on:
-  workflow_dispatch:
   push:
     branches:
-      # choose your default branch
-      - master
       - main
-    paths-ignore:
-      - '*.md'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout
-        uses: actions/checkout@master
+        uses: actions/checkout@v4
         with:
-          path: "src"
-
-      - name: Checkout builds
-        uses: actions/checkout@master
-        with:
-          ref: "builds"
-          path: "builds"
+          fetch-depth: 0
       
-      - name: Clean old builds
-        run: |
-          rm $GITHUB_WORKSPACE/builds/*.cs3 || true
-          rm $GITHUB_WORKSPACE/builds/*.jar || true
-
       - name: Setup JDK 17
-        uses: actions/setup-java@v1
+        uses: actions/setup-java@v4
         with:
-          java-version: 17
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Build Plugins
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+      
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+      
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+      
+      - name: Build plugins
+        run: ./gradlew make makePluginsJson
+      
+      - name: Copy files
         run: |
-          cd $GITHUB_WORKSPACE/src
-          chmod +x gradlew
-          ./gradlew make makePluginsJson
-          ./gradlew ensureJarCompatibility
-          cp **/build/*.cs3 $GITHUB_WORKSPACE/builds
-          cp **/build/*.jar $GITHUB_WORKSPACE/builds
-          cp build/plugins.json $GITHUB_WORKSPACE/builds
-
-      - name: Push builds
+          mkdir -p output
+          find . -name "*.cs3" -exec cp {} output/ \;
+          if [ -f plugins.json ]; then
+            cp plugins.json output/
+          fi
+      
+      - name: Upload plugins
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugins
+          path: output/
+      
+      - name: Deploy to builds branch
+        if: github.ref == 'refs/heads/main'
         run: |
-          cd $GITHUB_WORKSPACE/builds
-          git config --local user.email "actions@github.com"
-          git config --local user.name "GitHub Actions"
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git fetch origin builds:builds || git checkout --orphan builds
+          git checkout builds
+          rm -rf *
+          cp -r ../output/* . 2>/dev/null || true
           git add .
-          git commit --amend -m "Build $GITHUB_SHA" || exit 0   # do not error if nothing to commit
-          git push --force
+          git commit -m "Update plugins [skip ci]" --allow-empty
+          git push origin builds
