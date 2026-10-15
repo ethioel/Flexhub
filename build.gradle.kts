@@ -12,8 +12,8 @@ buildscript {
 
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
-        // FIXED: Changed -SNAPSHOT to master-SNAPSHOT for JitPack resolution
-        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
+        // Reverted to official -SNAPSHOT
+        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
@@ -68,8 +68,8 @@ subprojects {
     dependencies {
         val implementation by configurations
 
-        // FIXED: Changed -SNAPSHOT to master-SNAPSHOT for JitPack resolution
-        implementation("com.github.recloudstream.cloudstream:library:master-SNAPSHOT")
+        // Reverted to official -SNAPSHOT
+        implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
 
         implementation(kotlin("stdlib"))
         implementation("com.github.Blatzar:NiceHttp:0.4.11")
