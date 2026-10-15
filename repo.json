@@ -1,0 +1,9 @@
+{
+  "name": "Flexhub",
+  "iconUrl": "https://www.google.com/s2/favicons?domain=1flex.org&sz=128",
+  "description": "Flexhub CloudStream Repository",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/ethioel/Flexhub/builds/plugins.json?v=9"
+  ]
+}
