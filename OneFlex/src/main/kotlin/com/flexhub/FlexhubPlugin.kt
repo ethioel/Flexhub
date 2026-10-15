@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class FlexhubPlugin : Plugin() {
     override fun load(context: Context) {
-        
         registerMainAPI(OneFlexProvider())
     }
 }
