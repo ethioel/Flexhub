@@ -1,0 +1,24 @@
+[
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=1flex.org&sz=%size%",
+        "fileHash": "sha256-0160265874f4ac0a78af4d0f56729ad94250deafd576583676684c3fe494e756",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/ethioel/Flexhub",
+        "fileSize": 89174,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "ethioel"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 11,
+        "internalName": "OneFlex",
+        "description": "Movies, TV series and anime from 1Flex (1flex.org). Search, browse trending and stream via the built-in player.",
+        "url": "https://raw.githubusercontent.com/ethioel/Flexhub/builds/OneFlex.cs3",
+        "name": "OneFlex"
+    }
+]
