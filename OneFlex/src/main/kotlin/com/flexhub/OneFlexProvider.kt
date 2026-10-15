@@ -60,20 +60,22 @@ class OneFlexProvider : MainAPI() {
         val type = if (url.contains("/movie/") || url.contains("/film/")) TvType.Movie else TvType.TvSeries
 
         val episodes = if (type == TvType.Movie) {
-            // FIXED: Changed 'data' to 'url' to match modern CloudStream API
-            listOf(newEpisode(url = url, name = "Movie", episode = 1))
+            // FIXED: Use trailing lambda to set episode properties
+            listOf(newEpisode(url) {
+                name = "Movie"
+                episode = 1
+            })
         } else {
             document.select("div.episode, li.season_episode, .ss-list a").map { element ->
                 val epHref = fixUrl(element.selectFirst("a")?.attr("href") ?: element.attr("href"))
                 val epName = element.selectFirst("a")?.text() ?: element.text()
                 val epNum = epName.filter { it.isDigit() }.toIntOrNull()
                 
-                // FIXED: Changed 'data' to 'url' to match modern CloudStream API
-                newEpisode(
-                    url = epHref,
-                    name = epName,
+                // FIXED: Use trailing lambda to set episode properties
+                newEpisode(epHref) {
+                    name = epName
                     episode = epNum
-                )
+                }
             }
         }
 
