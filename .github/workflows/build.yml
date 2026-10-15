@@ -22,4 +22,4 @@ jobs:
       - name: Build plugins
         run: |
           chmod +x gradlew
-          ./gradlew make --stacktrace
+          ./gradlew make --refresh-dependencies --stacktrace
