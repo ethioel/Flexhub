@@ -12,8 +12,8 @@ buildscript {
 
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
-        // FIXED: Use a specific, known-working commit hash to bypass broken -SNAPSHOT caching
-        classpath("com.github.recloudstream:gradle:81b1d424d2")
+        // OFFICIAL: Must be -SNAPSHOT. JitPack timeouts are transient and resolve on re-run.
+        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
@@ -68,8 +68,8 @@ subprojects {
     dependencies {
         val implementation by configurations
 
-        // FIXED: Use the 'pre-release' tag which is stable on JitPack, avoiding -SNAPSHOT cache issues
-        implementation("com.github.recloudstream.cloudstream:library:pre-release")
+        // OFFICIAL: Must be -SNAPSHOT for the library
+        implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
 
         implementation(kotlin("stdlib"))
         implementation("com.github.Blatzar:NiceHttp:0.4.11")
