@@ -1,7 +1,6 @@
-import com.android.build.gradle.BaseExtension
 import com.lagradost.cloudstream3.gradle.CloudstreamExtension
+import com.android.build.gradle.BaseExtension
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 
 buildscript {
     repositories {
@@ -11,9 +10,9 @@ buildscript {
     }
 
     dependencies {
-        classpath("com.android.tools.build:gradle:8.7.3")
-        // Reverted to official -SNAPSHOT
-        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
+        classpath("com.android.tools.build:gradle:8.2.2")
+        // FIXED: Use a specific, known-working commit hash instead of broken -SNAPSHOT
+        classpath("com.github.recloudstream:gradle:81b1d424d2")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
@@ -37,6 +36,7 @@ subprojects {
 
     cloudstream {
         setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/ethioel/Flexhub")
+        authors = listOf("FlexhubDev")
     }
 
     android {
@@ -44,18 +44,18 @@ subprojects {
 
         defaultConfig {
             minSdk = 21
-            compileSdkVersion(35)
-            targetSdk = 35
+            compileSdkVersion(33)
+            targetSdk = 33
         }
 
         compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_1_8
-            targetCompatibility = JavaVersion.VERSION_1_8
+            sourceCompatibility = JavaVersion.VERSION_17
+            targetCompatibility = JavaVersion.VERSION_17
         }
 
-        tasks.withType<KotlinJvmCompile> {
+        tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
             compilerOptions {
-                jvmTarget.set(JvmTarget.JVM_1_8)
+                jvmTarget.set(JvmTarget.JVM_17)
                 freeCompilerArgs.addAll(
                     "-Xno-call-assertions",
                     "-Xno-param-assertions",
@@ -66,16 +66,17 @@ subprojects {
     }
 
     dependencies {
+        val cloudstream by configurations
         val implementation by configurations
 
-        // Reverted to official -SNAPSHOT
-        implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
+        // FIXED: Use the 'cloudstream' configuration with pre-release artifact
+        cloudstream("com.lagradost:cloudstream3:pre-release")
 
         implementation(kotlin("stdlib"))
         implementation("com.github.Blatzar:NiceHttp:0.4.11")
-        implementation("org.jsoup:jsoup:1.18.3")
-        implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
-        implementation("com.github.teamnewpipe:NewPipeExtractor:v0.25.2")
+        implementation("org.jsoup:jsoup:1.17.2")
+        implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.15.3")
+        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
     }
 }
 
