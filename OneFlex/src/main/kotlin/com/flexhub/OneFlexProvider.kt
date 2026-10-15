@@ -29,7 +29,6 @@ class OneFlexProvider : MainAPI() {
             }
         }
         
-        // FIXED: Use newHomePageResponse instead of deprecated constructor
         return newHomePageResponse(listOf(HomePageList("Trending on Flexhub", homeList)), hasNext = false)
     }
 
@@ -61,17 +60,17 @@ class OneFlexProvider : MainAPI() {
         val type = if (url.contains("/movie/") || url.contains("/film/")) TvType.Movie else TvType.TvSeries
 
         val episodes = if (type == TvType.Movie) {
-            // FIXED: Use newEpisode instead of deprecated constructor
-            listOf(newEpisode(data = url, name = "Movie", episode = 1))
+            // FIXED: Changed 'data' to 'url' to match modern CloudStream API
+            listOf(newEpisode(url = url, name = "Movie", episode = 1))
         } else {
             document.select("div.episode, li.season_episode, .ss-list a").map { element ->
                 val epHref = fixUrl(element.selectFirst("a")?.attr("href") ?: element.attr("href"))
                 val epName = element.selectFirst("a")?.text() ?: element.text()
                 val epNum = epName.filter { it.isDigit() }.toIntOrNull()
                 
-                // newEpisode instead of deprecated constructor
+                // FIXED: Changed 'data' to 'url' to match modern CloudStream API
                 newEpisode(
-                    data = epHref,
+                    url = epHref,
                     name = epName,
                     episode = epNum
                 )
