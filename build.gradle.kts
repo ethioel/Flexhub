@@ -66,10 +66,13 @@ subprojects {
     }
 
     dependencies {
+        val cloudstream by configurations
         val implementation by configurations
 
-        // OFFICIAL: Must be -SNAPSHOT for the library
-        implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
+        // OFFICIAL: compile-time stubs for all CloudStream classes (the app provides them at runtime).
+        // The old com.github.recloudstream.cloudstream:library:-SNAPSHOT artifact no longer contains
+        // the Plugin class, which broke compilation.
+        cloudstream("com.lagradost:cloudstream3:pre-release")
 
         implementation(kotlin("stdlib"))
         implementation("com.github.Blatzar:NiceHttp:0.4.11")
