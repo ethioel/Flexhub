@@ -3,6 +3,6 @@
   "description": "Flexhub CloudStream Repository",
   "manifestVersion": 1,
   "pluginLists": [
-    "https://raw.githubusercontent.com/ethioel/Flexhub/builds/plugins/OneFlex.cs3"
+    "https://raw.githubusercontent.com/ethioel/Flexhub/builds/plugins.json"
   ]
 }
