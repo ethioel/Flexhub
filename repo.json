@@ -1,5 +1,6 @@
-{
+﻿{
   "name": "Flexhub",
+  "iconUrl": "https://www.google.com/s2/favicons?domain=1flex.org&sz=128",
   "description": "Flexhub CloudStream Repository",
   "manifestVersion": 1,
   "pluginLists": [
