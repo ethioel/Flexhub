@@ -11,14 +11,17 @@ import com.lagradost.cloudstream3.utils.*
  * and third-party embed players (vidlink.pro / viduki / vidzee). Scraping the HTML
  * yields nothing, so all data comes from the same JSON API the site itself uses.
  */
-class OneFlexProvider : MainAPI() {
-    override var name = "Flexhub (1Flex/1Shows)"
+/**
+ * One provider instance per 1flex-family site (fubuki's multi-server stack:
+ * Next.js frontends over shared TMDB proxies + the api.wecollege.net player API).
+ * Metadata and playback are shared; only the site name and main URL differ.
+ * Alt domains are registered separately so the catalog survives takedowns.
+ */
+open class FlexhubFamilyProvider(override var name: String, override var mainUrl: String) : MainAPI() {
     override val hasMainPage = true
     override val hasChromecastSupport = true
     override val instantLinkLoading = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
-
-    override var mainUrl = "https://www.1flex.org"
 
     private val apiUrl = "https://db.1flex.org"
     private val vidyApi = "https://api.wecollege.net"
@@ -514,3 +517,14 @@ class OneFlexProvider : MainAPI() {
         return found
     }
 }
+
+class OneFlexProvider : FlexhubFamilyProvider("1Flex (Flexhub)", "https://www.1flex.org")
+class OneShowsProvider : FlexhubFamilyProvider("1Shows (Flexhub)", "https://www.1shows.org")
+class OneShowsAltProvider : FlexhubFamilyProvider("1Shows Alt (Flexhub)", "https://1shows.bz")
+class OneTubeProvider : FlexhubFamilyProvider("1Tube (Flexhub)", "https://www.1tube.org")
+class AniCineProvider : FlexhubFamilyProvider("AniCine (Flexhub)", "https://anicine.sbs")
+class SixtySevenMoviesProvider : FlexhubFamilyProvider("67movies (Flexhub)", "https://67movies.st")
+class NetShowsProvider : FlexhubFamilyProvider("Netshows (Flexhub)", "https://netshows.xyz")
+class CineVibeProvider : FlexhubFamilyProvider("CineVibe (Flexhub)", "https://cinevibe.cc")
+class KaitoTvProvider : FlexhubFamilyProvider("KaitoTV (Flexhub)", "https://kaitotv.com")
+class CineHdProvider : FlexhubFamilyProvider("CineHD (Flexhub)", "https://cinehd.vc")

@@ -8,5 +8,14 @@ import com.lagradost.cloudstream3.plugins.Plugin
 class FlexhubPlugin : Plugin() {
     override fun load(context: Context) {
         registerMainAPI(OneFlexProvider())
+        registerMainAPI(OneShowsProvider())
+        registerMainAPI(OneShowsAltProvider())
+        registerMainAPI(OneTubeProvider())
+        registerMainAPI(AniCineProvider())
+        registerMainAPI(SixtySevenMoviesProvider())
+        registerMainAPI(NetShowsProvider())
+        registerMainAPI(CineVibeProvider())
+        registerMainAPI(KaitoTvProvider())
+        registerMainAPI(CineHdProvider())
     }
 }
