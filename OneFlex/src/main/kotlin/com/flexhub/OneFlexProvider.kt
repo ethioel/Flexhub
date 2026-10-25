@@ -21,7 +21,7 @@ class OneFlexProvider : MainAPI() {
     override var mainUrl = "https://www.1flex.org"
 
     private val apiUrl = "https://db.1flex.org"
-    private val embedProvidersUrl = "https://api.viduki.net/embed_providers?site=1flex"
+    private val vidyApi = "https://api.wecollege.net"
     private val imageUrl = "https://image.tmdb.org/t/p/w500"
     private val stillUrl = "https://image.tmdb.org/t/p/w300"
 
@@ -69,6 +69,7 @@ class OneFlexProvider : MainAPI() {
         @JsonProperty("tagline") val tagline: String? = null,
         @JsonProperty("status") val status: String? = null,
         @JsonProperty("vote_average") val rating: Double? = null,
+        @JsonProperty("imdb_id") val imdbId: String? = null,
         @JsonProperty("genres") val genres: List<TmdbGenre> = emptyList(),
     )
 
@@ -90,6 +91,7 @@ class OneFlexProvider : MainAPI() {
         @JsonProperty("status") val status: String? = null,
         @JsonProperty("vote_average") val rating: Double? = null,
         @JsonProperty("number_of_seasons") val numberOfSeasons: Int? = null,
+        @JsonProperty("imdb_id") val imdbId: String? = null,
         @JsonProperty("seasons") val seasons: List<TmdbSeason> = emptyList(),
         @JsonProperty("genres") val genres: List<TmdbGenre> = emptyList(),
     )
@@ -105,16 +107,6 @@ class OneFlexProvider : MainAPI() {
 
     private data class TmdbSeasonDetails(
         @JsonProperty("episodes") val episodes: List<TmdbEpisode> = emptyList(),
-    )
-
-    private data class EmbedProvider(
-        @JsonProperty("id") val id: String? = null,
-        @JsonProperty("movie") val movie: String? = null,
-        @JsonProperty("tv") val tv: String? = null,
-    )
-
-    private data class EmbedProvidersResponse(
-        @JsonProperty("providers") val providers: List<EmbedProvider> = emptyList(),
     )
 
     private fun TmdbItem.tvType(): TvType {
@@ -197,11 +189,20 @@ class OneFlexProvider : MainAPI() {
 
         if (type == "movie") {
             val d = app.get("$apiUrl/movie/$id", headers = apiHeaders).parsed<TmdbMovieDetails>()
+            val data = mediaDataJson(
+                MediaData(
+                    id = id,
+                    type = "movie",
+                    title = d.title ?: d.originalTitle,
+                    year = d.releaseDate?.substringBefore('-')?.toIntOrNull(),
+                    imdb = d.imdbId,
+                )
+            )
             return newMovieLoadResponse(
                 d.title ?: d.originalTitle ?: "Unknown",
                 "$mainUrl/movie/$id",
                 TvType.Movie,
-                "$mainUrl/movie/$id",
+                data,
             ) {
                 posterUrl = d.posterPath?.let { "$imageUrl$it" }
                 backgroundPosterUrl = d.backdropPath?.let { "$imageUrl$it" }
@@ -224,7 +225,18 @@ class OneFlexProvider : MainAPI() {
                 app.get("$apiUrl/tv/$id/season/$sn", headers = apiHeaders)
                     .parsed<TmdbSeasonDetails>().episodes.mapNotNull { ep ->
                         val epNum = ep.episodeNumber ?: return@mapNotNull null
-                        newEpisode("$mainUrl/tv/$id/$sn/$epNum") {
+                        val epData = mediaDataJson(
+                            MediaData(
+                                id = id,
+                                type = "tv",
+                                title = d.name ?: d.originalName,
+                                year = d.firstAirDate?.substringBefore('-')?.toIntOrNull(),
+                                imdb = d.imdbId,
+                                season = sn,
+                                episode = epNum,
+                            )
+                        )
+                        newEpisode(epData) {
                             name = ep.name
                             episode = epNum
                             season = sn
@@ -271,30 +283,184 @@ class OneFlexProvider : MainAPI() {
         }.getOrNull()
     }
 
-    private suspend fun getEmbedUrls(type: String, id: Int, season: Int?, episode: Int?): List<String> {
-        val templates = mutableListOf<String>()
-        try {
-            val providers = app.get(embedProvidersUrl, headers = apiHeaders)
-                .parsed<EmbedProvidersResponse>().providers
-            providers.forEach { p ->
-                val template = if (type == "movie") p.movie else p.tv
-                if (!template.isNullOrBlank()) templates += template
+    // --- Playback: 1flex family player API (api.wecollege.net, as used by vidy.st) ---
+
+    private data class MediaData(
+        @JsonProperty("id") val id: Int,
+        @JsonProperty("type") val type: String,
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("year") val year: Int? = null,
+        @JsonProperty("imdb") val imdb: String? = null,
+        @JsonProperty("season") val season: Int? = null,
+        @JsonProperty("episode") val episode: Int? = null,
+    )
+
+    private data class WecollegeSeed(
+        @JsonProperty("seed") val seed: String? = null,
+    )
+
+    private data class WecollegeSource(
+        @JsonProperty("quality") val quality: String? = null,
+        @JsonProperty("url") val url: String? = null,
+    )
+
+    private data class WecollegeSubtitle(
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("label") val label: String? = null,
+        @JsonProperty("language") val language: String? = null,
+    )
+
+    private data class WecollegePayload(
+        @JsonProperty("sources") val sources: List<WecollegeSource> = emptyList(),
+        @JsonProperty("subtitles") val subtitles: List<WecollegeSubtitle> = emptyList(),
+        @JsonProperty("playlist") val playlist: String? = null,
+    )
+
+    private val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+
+    private fun mediaDataJson(data: MediaData): String = mapper.writeValueAsString(data)
+
+    private fun vidyHeaders(): Map<String, String> = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept" to "*/*",
+        "Referer" to "https://vidy.st/",
+        "Origin" to "https://vidy.st",
+    )
+
+    /**
+     * Port of the decryption used by the 1flex/vidy.st family player
+     * (obfuscated JS: custom FNV-seeded keystream + "mvm1" magic prefix).
+     */
+    private object VidyCipher {
+        private val K = longArrayOf(
+            1116352408L, 1899447441L, 3049323471L, 3921009573L, 961987163L, 1508970993L,
+            2453635748L, 2870763221L, 3624381080L, 310598401L, 607225278L, 1426881987L,
+            1925078388L, 2162078206L, 2614888103L, 3248222580L,
+        )
+
+        private fun imul(a: Int, b: Int): Int = (a.toLong() * b.toLong()).toInt()
+
+        private fun m(e0: Int): Int {
+            var e = e0
+            e = e xor (e ushr 16)
+            e = imul(e, 2246822507.toInt())
+            e = e xor (e ushr 13)
+            e = imul(e, 3266489909.toInt())
+            e = e xor (e ushr 16)
+            return e
+        }
+
+        private fun p(e0: Int, t0: Int): Int {
+            val t = t0 and 31
+            if (t == 0) return e0
+            return (e0 shl t) or (e0 ushr (32 - t))
+        }
+
+        private class State {
+            val s = IntArray(61)
+            val assigned = BooleanArray(61)
+            var acc = 0
+        }
+
+        private fun makeState(seed: String, mediaId: String): State {
+            val st = State()
+            var t = 2166136261.toInt()
+            for (ch in seed) t = imul(t xor ch.code, 16777619)
+            t = m(t)
+            val mediaU = mediaId.trim().toLongOrNull() ?: 0L
+            var s = m(t xor m(mediaU.toInt() xor 2654435769.toInt()))
+            for (e in 0 until 8) {
+                val tt = (s.toLong() and 0xFFFFFFFFL).rem(61).toInt()
+                s = p(s + 2654435769.toInt(), 7 + (7 and e))
+                st.s[tt] = s xor m(s)
+                st.assigned[tt] = true
+                s = m(s + tt)
             }
+            st.acc = m(2779096485.toInt() xor s)
+            return st
+        }
+
+        private fun next(st: State, counter: Int): Int {
+            val d = (st.acc.toLong() and 0xFFFFFFFFL).rem(61).toInt()
+            val exists = st.assigned[d]
+            val r = if (exists) -1 else 0
+            val i = if (exists) st.s[d] else 0
+            val s = i xor imul(2654435769.toInt(), counter + 1)
+            val l = (st.acc xor s) or ((st.acc and s) and r)
+            val a = p(l + st.acc, 31 and d)
+            val b = p(st.acc, 31 and imul(d, 7))
+            val n = m((a xor b) + 2654435769.toInt())
+            st.s[d] = n
+            st.assigned[d] = true
+            st.acc = n
+            return n
+        }
+
+        private fun keystream(seed: String, mediaId: String, len: Int): ByteArray {
+            val st = makeState(seed, mediaId)
+            val out = ByteArray(len)
+            var i = 0
+            var counter = 0
+            while (i < len) {
+                val v = next(st, counter++)
+                out[i++] = (v and 255).toByte()
+                if (i < len) out[i++] = ((v ushr 8) and 255).toByte()
+                if (i < len) out[i++] = ((v ushr 16) and 255).toByte()
+                if (i < len) out[i++] = ((v ushr 24) and 255).toByte()
+            }
+            return out
+        }
+
+        fun decrypt(payloadB64: String, seed: String, mediaId: String): String {
+            val clean = payloadB64.trim().replace('-', '+').replace('_', '/')
+            val pad = (4 - clean.length % 4) % 4
+            val data = android.util.Base64.decode(clean + "=".repeat(pad), android.util.Base64.DEFAULT)
+            val ks = keystream(seed, mediaId, data.size)
+            for (i in data.indices) data[i] = (data[i].toInt() xor ks[i].toInt()).toByte()
+            val ok = data.size >= 4 &&
+                data[0] == 109.toByte() && data[1] == 118.toByte() &&
+                data[2] == 109.toByte() && data[3] == 49.toByte()
+            if (!ok) throw ErrorLoadingException("decrypt failed: bad seed or tampered payload")
+            return String(data, 4, data.size - 4, Charsets.UTF_8)
+        }
+    }
+
+    private suspend fun getVidyPayload(media: MediaData): WecollegePayload? {
+        val mediaIdStr = media.id.toString()
+        val seed = try {
+            app.get("$vidyApi/seed?mediaId=$mediaIdStr", headers = vidyHeaders())
+                .parsed<WecollegeSeed>().seed
         } catch (e: Exception) {
-            // Cloudflare-protected; fall back to the known default embed
+            null
+        } ?: return null
+
+        val encodedTitle = java.net.URLEncoder.encode(media.title ?: "", "UTF-8")
+        val query = buildString {
+            append("title=").append(encodedTitle)
+            append("&mediaType=").append(media.type)
+            media.year?.let { append("&year=").append(it) }
+            append("&episodeId=").append(media.episode ?: 1)
+            append("&seasonId=").append(media.season ?: 1)
+            append("&tmdbId=").append(media.id)
+            media.imdb?.let { append("&imdbId=").append(it) }
+            append("&enc=2&seed=").append(java.net.URLEncoder.encode(seed, "UTF-8"))
         }
-        if (templates.isEmpty()) {
-            if (type == "movie") {
-                templates += "https://vidlink.pro/movie/{id}"
-            } else {
-                templates += "https://vidlink.pro/tv/{id}/{s}/{e}"
+
+        for (city in listOf("miami", "boise", "atlanta", "dallas", "seattle", "phoenix", "portland", "austin")) {
+            val text = try {
+                app.get("$vidyApi/$city/sources?$query", headers = vidyHeaders()).text
+            } catch (e: Exception) {
+                continue
             }
+            val payload = try {
+                VidyCipher.decrypt(text, seed, mediaIdStr)
+            } catch (e: Exception) {
+                continue
+            }
+            val parsed = runCatching { mapper.readValue(payload, WecollegePayload::class.java) }.getOrNull() ?: continue
+            if (parsed.sources.isNotEmpty() || !parsed.playlist.isNullOrBlank()) return parsed
         }
-        return templates.map { t ->
-            t.replace("{id}", id.toString())
-                .replace("{s}", (season ?: 1).toString())
-                .replace("{e}", (episode ?: 1).toString())
-        }
+        return null
     }
 
     override suspend fun loadLinks(
@@ -303,21 +469,39 @@ class OneFlexProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val (type, id, seasonEpisode) = parseDataUrl(data)
-        val embeds = if (type == "movie") {
-            getEmbedUrls("movie", id, null, null)
-        } else {
-            getEmbedUrls("tv", id, seasonEpisode?.first ?: 1, seasonEpisode?.second ?: 1)
+        val media = runCatching { mapper.readValue(data, MediaData::class.java) }.getOrNull() ?: return false
+        val payload = getVidyPayload(media) ?: return false
+        val referer = "https://vidy.st/"
+        var found = false
+
+        payload.playlist?.let { master ->
+            callback.invoke(
+                newExtractorLink(name, "${name} (Auto)", master) {
+                    this.referer = referer
+                    this.type = ExtractorLinkType.M3U8
+                }
+            )
+            found = true
         }
 
-        var found = false
-        for (embed in embeds.distinct()) {
-            try {
-                if (loadExtractor(embed, "$mainUrl/", subtitleCallback, callback)) found = true
-            } catch (e: Exception) {
-                // try next embed
-            }
+        for (src in payload.sources) {
+            val url = src.url ?: continue
+            val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
+            callback.invoke(
+                newExtractorLink(name, "${name} (${src.quality ?: "auto"})", url) {
+                    this.quality = quality
+                    this.referer = referer
+                    this.type = ExtractorLinkType.M3U8
+                }
+            )
+            found = true
         }
+
+        for (sub in payload.subtitles) {
+            val url = sub.url ?: continue
+            subtitleCallback.invoke(newSubtitleFile(sub.label ?: sub.language ?: "Subtitle", url))
+        }
+
         return found
     }
 }
