@@ -474,9 +474,21 @@ class OneFlexProvider : MainAPI() {
         val referer = "https://vidy.st/"
         var found = false
 
-        payload.playlist?.let { master ->
+        // 720p first (player default), then remaining qualities, adaptive master last
+        val qualityOrder = listOf(720, 1080, 2160, 1440, 480, 360, 240)
+        val sorted = payload.sources
+            .filter { !it.url.isNullOrBlank() }
+            .sortedBy { src ->
+                val q = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: -1
+                qualityOrder.indexOf(q).let { if (it == -1) qualityOrder.size else it }
+            }
+
+        for (src in sorted) {
+            val url = src.url ?: continue
+            val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
             callback.invoke(
-                newExtractorLink(name, "${name} (Auto)", master) {
+                newExtractorLink(name, "${name} (${src.quality ?: "auto"})", url) {
+                    this.quality = quality
                     this.referer = referer
                     this.type = ExtractorLinkType.M3U8
                 }
@@ -484,12 +496,9 @@ class OneFlexProvider : MainAPI() {
             found = true
         }
 
-        for (src in payload.sources) {
-            val url = src.url ?: continue
-            val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
+        payload.playlist?.let { master ->
             callback.invoke(
-                newExtractorLink(name, "${name} (${src.quality ?: "auto"})", url) {
-                    this.quality = quality
+                newExtractorLink(name, "${name} (Auto)", master) {
                     this.referer = referer
                     this.type = ExtractorLinkType.M3U8
                 }
