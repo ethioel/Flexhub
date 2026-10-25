@@ -428,15 +428,8 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         }
     }
 
-    private suspend fun getVidyPayload(media: MediaData): WecollegePayload? {
+    private suspend fun getVidyPayload(media: MediaData, city: String, seed: String): WecollegePayload? {
         val mediaIdStr = media.id.toString()
-        val seed = try {
-            app.get("$vidyApi/seed?mediaId=$mediaIdStr", headers = vidyHeaders())
-                .parsed<WecollegeSeed>().seed
-        } catch (e: Exception) {
-            null
-        } ?: return null
-
         val encodedTitle = java.net.URLEncoder.encode(media.title ?: "", "UTF-8")
         val query = buildString {
             append("title=").append(encodedTitle)
@@ -449,21 +442,14 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             append("&enc=2&seed=").append(java.net.URLEncoder.encode(seed, "UTF-8"))
         }
 
-        for (city in listOf("miami", "boise", "atlanta", "dallas", "seattle", "phoenix", "portland", "austin")) {
-            val text = try {
-                app.get("$vidyApi/$city/sources?$query", headers = vidyHeaders()).text
-            } catch (e: Exception) {
-                continue
-            }
-            val payload = try {
-                VidyCipher.decrypt(text, seed, mediaIdStr)
-            } catch (e: Exception) {
-                continue
-            }
-            val parsed = runCatching { mapper.readValue(payload, WecollegePayload::class.java) }.getOrNull() ?: continue
-            if (parsed.sources.isNotEmpty() || !parsed.playlist.isNullOrBlank()) return parsed
+        return try {
+            val text = app.get("$vidyApi/$city/sources?$query", headers = vidyHeaders()).text
+            VidyCipher.decrypt(text, seed, mediaIdStr).let { json ->
+                runCatching { mapper.readValue(json, WecollegePayload::class.java) }.getOrNull()
+            }?.takeIf { it.sources.isNotEmpty() || !it.playlist.isNullOrBlank() }
+        } catch (e: Exception) {
+            null
         }
-        return null
     }
 
     override suspend fun loadLinks(
@@ -473,45 +459,73 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val media = runCatching { mapper.readValue(data, MediaData::class.java) }.getOrNull() ?: return false
-        val payload = getVidyPayload(media) ?: return false
+        val mediaIdStr = media.id.toString()
         val referer = "https://vidy.st/"
-        var found = false
 
-        // 720p first (player default), then remaining qualities, adaptive master last
-        val qualityOrder = listOf(720, 1080, 2160, 1440, 480, 360, 240)
-        val sorted = payload.sources
-            .filter { !it.url.isNullOrBlank() }
-            .sortedBy { src ->
-                val q = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: -1
-                qualityOrder.indexOf(q).let { if (it == -1) qualityOrder.size else it }
+        val seed = try {
+            app.get("$vidyApi/seed?mediaId=$mediaIdStr", headers = vidyHeaders())
+                .parsed<WecollegeSeed>().seed
+        } catch (e: Exception) {
+            null
+        } ?: return false
+
+        // Multiple city servers = alternative sources; up to 3 so the player
+        // can fall back when one CDN path errors (ExoPlayer 2004).
+        val cities = listOf("miami", "boise", "atlanta", "dallas", "seattle", "phoenix", "portland", "austin")
+        val subtitleUrls = mutableSetOf<String>()
+        var found = false
+        var added = 0
+
+        for (city in cities) {
+            if (added >= 3) break
+            val payload = getVidyPayload(media, city, seed) ?: continue
+            val sourceName = "${name} • ${city.replaceFirstChar { it.uppercase() }}"
+            val streamUrl = payload.playlist ?: payload.sources.firstNotNullOfOrNull { it.url } ?: continue
+
+            val links = try {
+                M3u8Helper.generateM3u8(
+                    source = sourceName,
+                    streamUrl = streamUrl,
+                    referer = referer,
+                )
+            } catch (e: Exception) {
+                null
             }
 
-        for (src in sorted) {
-            val url = src.url ?: continue
-            val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
-            callback.invoke(
-                newExtractorLink(name, "${name} (${src.quality ?: "auto"})", url) {
-                    this.quality = quality
-                    this.referer = referer
-                    this.type = ExtractorLinkType.M3U8
+            if (links.isNullOrEmpty()) {
+                // Fallback: emit the raw links if variant enumeration failed
+                payload.sources.forEach { src ->
+                    val url = src.url ?: return@forEach
+                    callback.invoke(
+                        newExtractorLink(name, "$sourceName (${src.quality ?: "auto"})", url) {
+                            this.quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
+                            this.referer = referer
+                            this.type = ExtractorLinkType.M3U8
+                        }
+                    )
+                    found = true
                 }
-            )
-            found = true
-        }
-
-        payload.playlist?.let { master ->
-            callback.invoke(
-                newExtractorLink(name, "${name} (Auto)", master) {
-                    this.referer = referer
-                    this.type = ExtractorLinkType.M3U8
+                payload.playlist?.let { master ->
+                    callback.invoke(
+                        newExtractorLink(name, "$sourceName (Auto)", master) {
+                            this.referer = referer
+                            this.type = ExtractorLinkType.M3U8
+                        }
+                    )
+                    found = true
                 }
-            )
-            found = true
-        }
+            } else {
+                links.forEach { callback.invoke(it) }
+                found = true
+            }
+            added++
 
-        for (sub in payload.subtitles) {
-            val url = sub.url ?: continue
-            subtitleCallback.invoke(newSubtitleFile(sub.label ?: sub.language ?: "Subtitle", url))
+            for (sub in payload.subtitles) {
+                val url = sub.url ?: continue
+                if (subtitleUrls.add(url)) {
+                    subtitleCallback.invoke(newSubtitleFile(sub.label ?: sub.language ?: "Subtitle", url))
+                }
+            }
         }
 
         return found
