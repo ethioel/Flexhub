@@ -1,21 +1,13 @@
-package com.flexhub
+﻿package com.flexhub
 
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 
 /**
- * Provider for 1flex.org.
- *
- * The site is a client-rendered Next.js app backed by a TMDB proxy (db.1flex.org)
- * and third-party embed players (vidlink.pro / viduki / vidzee). Scraping the HTML
- * yields nothing, so all data comes from the same JSON API the site itself uses.
- */
-/**
  * One provider instance per 1flex-family site (fubuki's multi-server stack:
  * Next.js frontends over shared TMDB proxies + the api.wecollege.net player API).
  * Metadata and playback are shared; only the site name and main URL differ.
- * Alt domains are registered separately so the catalog survives takedowns.
  */
 open class FlexhubFamilyProvider(override var name: String, override var mainUrl: String) : MainAPI() {
     override val hasMainPage = true
@@ -479,7 +471,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         for (city in cities) {
             if (added >= 3) break
             val payload = getVidyPayload(media, city, seed) ?: continue
-            val sourceName = "${name} • ${city.replaceFirstChar { it.uppercase() }}"
+            val sourceName = "${name} - ${city.replaceFirstChar { it.uppercase() }}"
             val streamUrl = payload.playlist ?: payload.sources.firstNotNullOfOrNull { it.url } ?: continue
 
             val links = try {
@@ -532,13 +524,26 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     }
 }
 
-class OneFlexProvider : FlexhubFamilyProvider("1Flex (Flexhub)", "https://www.1flex.org")
-class OneShowsProvider : FlexhubFamilyProvider("1Shows (Flexhub)", "https://www.1shows.org")
-class OneShowsAltProvider : FlexhubFamilyProvider("1Shows Alt (Flexhub)", "https://1shows.bz")
-class OneTubeProvider : FlexhubFamilyProvider("1Tube (Flexhub)", "https://www.1tube.org")
-class AniCineProvider : FlexhubFamilyProvider("AniCine (Flexhub)", "https://anicine.sbs")
-class SixtySevenMoviesProvider : FlexhubFamilyProvider("67movies (Flexhub)", "https://67movies.st")
-class NetShowsProvider : FlexhubFamilyProvider("Netshows (Flexhub)", "https://netshows.xyz")
-class CineVibeProvider : FlexhubFamilyProvider("CineVibe (Flexhub)", "https://cinevibe.cc")
-class KaitoTvProvider : FlexhubFamilyProvider("KaitoTV (Flexhub)", "https://kaitotv.com")
-class CineHdProvider : FlexhubFamilyProvider("CineHD (Flexhub)", "https://cinehd.vc")
+
+// Alt domains are noted per site; they serve identical catalogs, so each site
+// is registered once. 1Shows / 1Tube / 1shows.bz are alts of 1Flex.
+class OneFlexProvider : FlexhubFamilyProvider("1Flex (Flexhub)", "https://www.1flex.org") // alts: www.1shows.org, www.1tube.org, 1shows.bz
+class AniCineProvider : FlexhubFamilyProvider("AniCine (Flexhub)", "https://anicine.sbs") // alt: anicine.xyz
+class ZetMoonProvider : FlexhubFamilyProvider("ZetMoon (Flexhub)", "https://zetmoon.live")
+class SixtySevenMoviesProvider : FlexhubFamilyProvider("67movies (Flexhub)", "https://67movies.st") // alt: phantomflix.net
+class TonkaCineProvider : FlexhubFamilyProvider("TonkaCine (Flexhub)", "https://tonkacine.watch") // alt: multi.tonkacine.watch
+class PrimeShowsProvider : FlexhubFamilyProvider("PrimeShows (Flexhub)", "https://www.primeshows.org") // alts: netshows.xyz, youshows.org
+class MoovieProvider : FlexhubFamilyProvider("Moovie (Flexhub)", "https://moovie.fun") // alt: streamaggregator.in
+class AniXxProvider : FlexhubFamilyProvider("AniXx (Flexhub)", "https://anixx.fun")
+class AuroraScreenProvider : FlexhubFamilyProvider("AuroraScreen (Flexhub)", "https://aurorascreen.org")
+class HydraHdProvider : FlexhubFamilyProvider("HydraHD (Flexhub)", "https://hydrahd.ws") // alt: hydrahd.com
+class FireFlixProvider : FlexhubFamilyProvider("FireFlix (Flexhub)", "https://fireflix4.pages.dev")
+class VidBoxProvider : FlexhubFamilyProvider("VidBox (Flexhub)", "https://vidbox.vc") // alts: cinehd.vc, hotflix.to
+class ZenCineProvider : FlexhubFamilyProvider("ZenCine (Flexhub)", "https://zencine.org")
+class CineWaveProvider : FlexhubFamilyProvider("CineWave (Flexhub)", "https://watch.cinewave.qzz.io")
+class CineStreamProvider : FlexhubFamilyProvider("CineStream (Flexhub)", "https://cinestream.kje.us") // geo-blocked in some regions
+class YouFlexProvider : FlexhubFamilyProvider("YouFlex (Flexhub)", "https://youflex.top")
+class FilmCaveProvider : FlexhubFamilyProvider("FilmCave (Flexhub)", "https://flixway.ru") // alt: filmcave.ru
+class FlixMixProvider : FlexhubFamilyProvider("FlixMix (Flexhub)", "https://flixmix.site")
+class FlyStreamProvider : FlexhubFamilyProvider("FlyStream (Flexhub)", "https://flystream.net")
+class StreamoProvider : FlexhubFamilyProvider("Streamo (Flexhub)", "https://streamo.pro")

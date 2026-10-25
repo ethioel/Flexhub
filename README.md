@@ -14,20 +14,30 @@ Then install the extensions you want from the list. Installed extensions update 
 
 ## Extensions
 
-| Provider | Content |
-|----------|---------|
-| 1Flex    | Movies, TV, Anime |
-| 1Shows   | Movies, TV |
-| 1Shows Alt | Movies, TV |
-| 1Tube    | Movies, TV |
-| AniCine  | Anime, Movies, TV |
-| 67movies | Movies, TV |
-| Netshows | Movies, TV |
-| CineVibe | Movies, TV |
-| KaitoTV  | Movies, TV |
-| CineHD   | Movies, TV |
+| Provider | Main domain | Alt domains |
+|----------|-------------|-------------|
+| 1Flex | 1flex.org | 1shows.org, 1tube.org, 1shows.bz |
+| AniCine | anicine.sbs | anicine.xyz |
+| ZetMoon | zetmoon.live | |
+| 67movies | 67movies.st | phantomflix.net |
+| TonkaCine | tonkacine.watch | multi.tonkacine.watch |
+| PrimeShows | primeshows.org | netshows.xyz, youshows.org |
+| Moovie | moovie.fun | streamaggregator.in |
+| AniXx | anixx.fun | |
+| AuroraScreen | aurorascreen.org | |
+| HydraHD | hydrahd.ws | hydrahd.com |
+| FireFlix | fireflix4.pages.dev | |
+| VidBox | vidbox.vc | cinehd.vc, hotflix.to |
+| ZenCine | zencine.org | |
+| CineWave | watch.cinewave.qzz.io | |
+| CineStream | cinestream.kje.us | |
+| YouFlex | youflex.top | |
+| FilmCave | flixway.ru | filmcave.ru |
+| FlixMix | flixmix.site | |
+| FlyStream | flystream.net | |
+| Streamo | streamo.pro | |
 
-All extensions support search, bookmarks-style home rows and multi-quality playback (default quality follows the app's player settings).
+All extensions share the same catalog features: search, home rows, episode lists, and multi-quality playback (default quality follows the app's player settings). If a domain goes down, its alt serves the identical catalog — install the matching provider from the list.
 
 ## Attribution
 

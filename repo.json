@@ -4,6 +4,6 @@
   "description": "Flexhub CloudStream Repository",
   "manifestVersion": 1,
   "pluginLists": [
-    "https://raw.githubusercontent.com/ethioel/Flexhub/builds/plugins.json?v=6"
+    "https://raw.githubusercontent.com/ethioel/Flexhub/builds/plugins.json?v=7"
   ]
 }
