@@ -27,5 +27,19 @@ class FlexhubPlugin : Plugin() {
         registerMainAPI(FlixMixProvider())
         registerMainAPI(FlyStreamProvider())
         registerMainAPI(StreamoProvider())
-    }
+        registerMainAPI(BingeFlixProvider())
+        registerMainAPI(CinebyProvider())
+        registerMainAPI(MeowlyProvider())
+        registerMainAPI(OnoflixProvider())
+        registerMainAPI(StreamGoblinProvider())
+        registerMainAPI(ZerostreamProvider())
+        registerMainAPI(SevenReelsProvider())
+        registerMainAPI(CandleStreamProvider())
+        registerMainAPI(ErnaxProvider())
+        registerMainAPI(Ev01Provider())
+        registerMainAPI(HeartiveProvider())
+        registerMainAPI(PlayTorrioProvider())
+        registerMainAPI(WatchOrbitProvider())
+        registerMainAPI(FlickerProvider())
+        registerMainAPI(CineStream2Provider())    }
 }

@@ -461,8 +461,9 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             null
         } ?: return false
 
-        // Multiple city servers = alternative sources; up to 3 so the player
-        // can fall back when one CDN path errors (ExoPlayer 2004).
+        // Up to 3 city servers: the first exposes the full per-quality list
+        // (direct media playlists = fast start), the rest are adaptive
+        // fallback sources for CDN errors (ExoPlayer 2004).
         val cities = listOf("miami", "boise", "atlanta", "dallas", "seattle", "phoenix", "portland", "austin")
         val subtitleUrls = mutableSetOf<String>()
         var found = false
@@ -471,26 +472,22 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         for (city in cities) {
             if (added >= 3) break
             val payload = getVidyPayload(media, city, seed) ?: continue
-            val sourceName = "${name} - ${city.replaceFirstChar { it.uppercase() }}"
-            val streamUrl = payload.playlist ?: payload.sources.firstNotNullOfOrNull { it.url } ?: continue
+            val cityLabel = city.replaceFirstChar { it.uppercase() }
 
-            val links = try {
-                M3u8Helper.generateM3u8(
-                    source = sourceName,
-                    streamUrl = streamUrl,
-                    referer = referer,
-                )
-            } catch (e: Exception) {
-                null
-            }
-
-            if (links.isNullOrEmpty()) {
-                // Fallback: emit the raw links if variant enumeration failed
-                payload.sources.forEach { src ->
-                    val url = src.url ?: return@forEach
+            if (added == 0) {
+                val order = listOf(720, 1080, 2160, 1440, 480, 360, 240)
+                val sorted = payload.sources
+                    .filter { !it.url.isNullOrBlank() }
+                    .sortedBy { src ->
+                        val q = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: -1
+                        order.indexOf(q).let { if (it == -1) order.size else it }
+                    }
+                for (src in sorted) {
+                    val url = src.url ?: continue
+                    val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
                     callback.invoke(
-                        newExtractorLink(name, "$sourceName (${src.quality ?: "auto"})", url) {
-                            this.quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
+                        newExtractorLink(name, "${name} - $cityLabel ${src.quality ?: "auto"}", url) {
+                            this.quality = quality
                             this.referer = referer
                             this.type = ExtractorLinkType.M3U8
                         }
@@ -499,7 +496,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                 }
                 payload.playlist?.let { master ->
                     callback.invoke(
-                        newExtractorLink(name, "$sourceName (Auto)", master) {
+                        newExtractorLink(name, "${name} - $cityLabel Auto", master) {
                             this.referer = referer
                             this.type = ExtractorLinkType.M3U8
                         }
@@ -507,7 +504,13 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                     found = true
                 }
             } else {
-                links.forEach { callback.invoke(it) }
+                val fallback = payload.playlist ?: payload.sources.firstNotNullOfOrNull { it.url } ?: continue
+                callback.invoke(
+                    newExtractorLink(name, "${name} - $cityLabel (Alt)", fallback) {
+                        this.referer = referer
+                        this.type = ExtractorLinkType.M3U8
+                    }
+                )
                 found = true
             }
             added++
@@ -547,3 +550,20 @@ class FilmCaveProvider : FlexhubFamilyProvider("FilmCave (Flexhub)", "https://fl
 class FlixMixProvider : FlexhubFamilyProvider("FlixMix (Flexhub)", "https://flixmix.site")
 class FlyStreamProvider : FlexhubFamilyProvider("FlyStream (Flexhub)", "https://flystream.net")
 class StreamoProvider : FlexhubFamilyProvider("Streamo (Flexhub)", "https://streamo.pro")
+
+// Additional multi-server sites (verified reachable, same TMDB catalog stack).
+class BingeFlixProvider : FlexhubFamilyProvider("BingeFlix (Flexhub)", "https://bingeflix.tv")
+class CinebyProvider : FlexhubFamilyProvider("Cineby (Flexhub)", "https://cinebytv.com")
+class MeowlyProvider : FlexhubFamilyProvider("Meowly (Flexhub)", "https://meowly.qzz.io")
+class OnoflixProvider : FlexhubFamilyProvider("Onoflix (Flexhub)", "https://onoflix.live")
+class StreamGoblinProvider : FlexhubFamilyProvider("StreamGoblin (Flexhub)", "https://streamgoblin.cc")
+class ZerostreamProvider : FlexhubFamilyProvider("Zerostream (Flexhub)", "https://zerostream.alwaysdata.net")
+class SevenReelsProvider : FlexhubFamilyProvider("7Reels (Flexhub)", "https://7reels.cc")
+class CandleStreamProvider : FlexhubFamilyProvider("CandleStream (Flexhub)", "https://candlestream.xyz")
+class ErnaxProvider : FlexhubFamilyProvider("Ernax (Flexhub)", "https://ernax.pro")
+class Ev01Provider : FlexhubFamilyProvider("Ev01 (Flexhub)", "https://ev01.ws")
+class HeartiveProvider : FlexhubFamilyProvider("Heartive (Flexhub)", "https://heartivelovestv.pages.dev")
+class PlayTorrioProvider : FlexhubFamilyProvider("PlayTorrio (Flexhub)", "https://playtorrio.pages.dev")
+class WatchOrbitProvider : FlexhubFamilyProvider("WatchOrbit (Flexhub)", "https://watchorbit.me")
+class FlickerProvider : FlexhubFamilyProvider("Flicker (Flexhub)", "https://flicker-mini.pages.dev")
+class CineStream2Provider : FlexhubFamilyProvider("CineStream Alt (Flexhub)", "https://cinestream2.kje.us") // alt: cinestream.kje.us
