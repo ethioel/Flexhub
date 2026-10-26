@@ -494,19 +494,20 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                     )
                     found = true
                 }
-                payload.playlist?.let { master ->
-                    callback.invoke(
-                        newExtractorLink(name, "${name} - $cityLabel Auto", master) {
-                            this.referer = referer
-                            this.type = ExtractorLinkType.M3U8
-                        }
-                    )
-                    found = true
-                }
             } else {
-                val fallback = payload.playlist ?: payload.sources.firstNotNullOfOrNull { it.url } ?: continue
+                // Alt cities: one direct link, preferring 720p to keep the
+                // default experience consistent (no adaptive Auto track).
+                val altOrder = listOf(720, 1080, 2160, 1440, 480, 360, 240)
+                val altSrc = payload.sources
+                    .filter { !it.url.isNullOrBlank() }
+                    .sortedBy { src ->
+                        val q = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: -1
+                        altOrder.indexOf(q).let { if (it == -1) altOrder.size else it }
+                    }
+                    .firstOrNull() ?: continue
                 callback.invoke(
-                    newExtractorLink(name, "${name} - $cityLabel (Alt)", fallback) {
+                    newExtractorLink(name, "${name} - $cityLabel (Alt)", altSrc.url!!) {
+                        this.quality = altSrc.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
                         this.referer = referer
                         this.type = ExtractorLinkType.M3U8
                     }
