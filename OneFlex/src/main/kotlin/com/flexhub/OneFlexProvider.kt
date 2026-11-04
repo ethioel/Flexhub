@@ -369,6 +369,14 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         "Origin" to "https://vidy.st",
     )
 
+    // City servers in the player's own order (extracted from the site bundle);
+    // unknown cities 404, so this list is authoritative.
+    private val vidyCities = listOf(
+        "miami", "boise", "seattle", "atlanta", "phoenix", "portland", "austin",
+        "dallas", "chicago", "nashville", "vegas", "reno", "oakland",
+        "munich", "berlin", "paris", "delhi", "cancun",
+    )
+
     /**
      * Port of the decryption used by the 1flex/vidy.st family player
      * (obfuscated JS: custom FNV-seeded keystream + "mvm1" magic prefix).
@@ -696,7 +704,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             null
         } ?: return
         val seen = mutableSetOf<String>()
-        for (city in listOf("miami", "boise", "atlanta")) {
+        for (city in vidyCities) {
             val payload = getVidyPayload(media, city, seed) ?: continue
             var emitted = false
             for (sub in payload.subtitles) {
@@ -743,17 +751,15 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             null
         }
 
-        // Up to 3 city servers: the first exposes the full per-quality list
-        // (direct media playlists = fast start), the rest are direct
-        // fallback sources for CDN errors (ExoPlayer 2004).
-        val cities = listOf("miami", "boise", "atlanta", "dallas", "seattle", "phoenix", "portland", "austin")
+        // Every city server: the first successful one exposes the full
+        // per-quality list (direct media playlists = fast start), every
+        // other city adds one direct fallback link for CDN errors (2004).
         val subtitles = linkedMapOf<String, SubtitleFile>()
         val links = mutableListOf<ExtractorLink>()
         var added = 0
 
-        if (seed != null) {
-            for (city in cities) {
-                if (added >= 3) break
+        if (seed != null) withTimeoutOrNull(20_000L) {
+            for (city in vidyCities) {
                 val payload = getVidyPayload(media, city, seed) ?: continue
                 val cityLabel = city.replaceFirstChar { it.uppercase() }
                 val sorted = payload.sources
