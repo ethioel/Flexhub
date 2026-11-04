@@ -1,7 +1,11 @@
 ﻿package com.flexhub
 
+import android.content.Context
+import android.content.SharedPreferences
+import android.util.LruCache
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -359,7 +363,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     private fun mediaDataJson(data: MediaData): String = mapper.writeValueAsString(data)
 
     private fun vidyHeaders(): Map<String, String> = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "User-Agent" to UA,
         "Accept" to "*/*",
         "Referer" to "https://vidy.st/",
         "Origin" to "https://vidy.st",
@@ -487,6 +491,225 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         }
     }
 
+    // --------------------------------------------------------
+    //  External backup resolvers — last resort when the vidy
+    //  player API fails entirely. Each call is time-bounded so
+    //  one dead provider can't block the others.
+    // --------------------------------------------------------
+
+    private fun httpHeaders(referer: String): Map<String, String> = mapOf(
+        "User-Agent" to UA,
+        "Referer" to referer,
+        "Accept" to "*/*",
+    )
+
+    private data class ExternalProvider(
+        val tag: String,
+        val servers: List<String>,
+        val resolver: suspend (MediaData, String, Int) -> List<ExtractorLink>,
+    )
+
+    private val externalProviders: List<ExternalProvider> = listOf(
+        ExternalProvider("Rivestream", listOf("quasar", "pulsar", "vega", "neutron", "orion")) { m, s, q -> resolveRivestream(m, s, q) },
+        ExternalProvider("Vidlink", listOf("default", "alpha", "beta")) { m, s, q -> resolveVidlink(m, s, q) },
+        ExternalProvider("Vidsrc", listOf("default")) { m, _, q -> resolveVidsrc(m, q) },
+        ExternalProvider("Embed.su", listOf("default")) { m, _, q -> resolveEmbedSu(m, q) },
+        ExternalProvider("2Embed", listOf("default")) { m, _, q -> resolve2Embed(m, q) },
+        ExternalProvider("AutoEmbed", listOf("default")) { m, _, q -> resolveAutoEmbed(m, q) },
+        ExternalProvider("Videasy", listOf("default")) { m, _, q -> resolveVideasy(m, q) },
+        ExternalProvider("Smashy", listOf("default")) { m, _, q -> resolveSmashy(m, q) },
+    )
+
+    /** Follows the first <iframe> and pulls the first m3u8/mp4 out of it. */
+    private suspend fun resolveEmbed(
+        embedUrl: String,
+        embedReferer: String,
+        quality: Int,
+        tag: String,
+    ): ExtractorLink? = withTimeoutOrNull(6_000L) {
+        try {
+            val headers = httpHeaders(embedReferer)
+            val html = app.get(embedUrl, headers = headers).text
+            val iframeSrc = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
+                .find(html)?.groupValues?.get(1) ?: return@withTimeoutOrNull null
+            val iframeUrl = if (iframeSrc.startsWith("http")) iframeSrc
+                else embedReferer.trimEnd('/') + "/" + iframeSrc.trimStart('/')
+            val iframeHtml = app.get(iframeUrl, headers = headers).text
+            val streamUrl = Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""")
+                .find(iframeHtml)?.groupValues?.get(1)
+                ?: Regex("""(https?://[^"'\s\\]+\.mp4[^"'\s\\]*)""")
+                    .find(iframeHtml)?.groupValues?.get(1)
+                ?: return@withTimeoutOrNull null
+            newExtractorLink(name, "$name - $tag (${quality}p)", streamUrl) {
+                this.quality = quality
+                this.referer = embedReferer
+                this.type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8
+                            else ExtractorLinkType.VIDEO
+                this.headers = headers
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private suspend fun resolveRivestream(m: MediaData, service: String, q: Int): List<ExtractorLink> {
+        val isMovie = m.type.equals("movie", ignoreCase = true)
+        val api = buildString {
+            append("https://www.rivestream.app/api/backendfetch?requestID=")
+            append(if (isMovie) "movieVideoProvider" else "tvVideoProvider")
+            append("&id=${m.id}&service=$service&secretKey=NzJiNjIxMjE=&proxyMode=undefined")
+            if (!isMovie) {
+                val s = m.season ?: return emptyList()
+                val e = m.episode ?: return emptyList()
+                append("&season=$s&episode=$e")
+            }
+        }
+        return withTimeoutOrNull(6_000L) {
+            val body = app.get(api, headers = httpHeaders("https://www.rivestream.app/")).text
+            val url = Regex("\"file\"\\s*:\\s*\"(https?[^\"]+)\"")
+                .find(body)?.groupValues?.get(1) ?: return@withTimeoutOrNull emptyList()
+            listOf(newExtractorLink(name, "$name - Rivestream ($service ${q}p)", url) {
+                this.quality = q
+                this.referer = "https://www.rivestream.app/"
+                this.type = if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                this.headers = httpHeaders("https://www.rivestream.app/")
+            })
+        } ?: emptyList()
+    }
+
+    private suspend fun resolveVidlink(m: MediaData, server: String, q: Int): List<ExtractorLink> {
+        val url = if (m.type.equals("movie", ignoreCase = true))
+            "https://vidlink.pro/api/b/movie/${m.id}"
+        else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            "https://vidlink.pro/api/b/tv/${m.id}/$s/$e"
+        }
+        return withTimeoutOrNull(6_000L) {
+            val json = app.get(url, headers = httpHeaders("https://vidlink.pro/")).text
+            val playlist = Regex("\"playlist\"\\s*:\\s*\"(https?[^\"]+)\"")
+                .find(json)?.groupValues?.get(1)
+                ?: Regex("\"file\"\\s*:\\s*\"(https?[^\"]+)\"")
+                    .find(json)?.groupValues?.get(1)
+                ?: return@withTimeoutOrNull emptyList()
+            listOf(newExtractorLink(name, "$name - Vidlink ($server ${q}p)", playlist) {
+                this.quality = q
+                this.referer = "https://vidlink.pro/"
+                this.type = ExtractorLinkType.M3U8
+                this.headers = httpHeaders("https://vidlink.pro/")
+            })
+        } ?: emptyList()
+    }
+
+    private suspend fun resolveVidsrc(m: MediaData, q: Int): List<ExtractorLink> {
+        val embed = if (m.type.equals("movie", ignoreCase = true))
+            "https://vidsrc.to/embed/movie/${m.id}"
+        else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            "https://vidsrc.to/embed/tv/${m.id}/$s/$e"
+        }
+        return listOfNotNull(resolveEmbed(embed, "https://vidsrc.to/", q, "Vidsrc"))
+    }
+
+    private suspend fun resolveEmbedSu(m: MediaData, q: Int): List<ExtractorLink> {
+        val embed = if (m.type.equals("movie", ignoreCase = true))
+            "https://embed.su/embed/movie/${m.id}"
+        else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            "https://embed.su/embed/tv/${m.id}/$s/$e"
+        }
+        return listOfNotNull(resolveEmbed(embed, "https://embed.su/", q, "Embed.su"))
+    }
+
+    private suspend fun resolve2Embed(m: MediaData, q: Int): List<ExtractorLink> {
+        val embed = if (m.type.equals("movie", ignoreCase = true))
+            "https://www.2embed.cc/embed/${m.id}"
+        else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            "https://www.2embed.cc/embedtv/${m.id}&s=$s&e=$e"
+        }
+        return listOfNotNull(resolveEmbed(embed, "https://www.2embed.cc/", q, "2Embed"))
+    }
+
+    private suspend fun resolveAutoEmbed(m: MediaData, q: Int): List<ExtractorLink> {
+        val embed = if (m.type.equals("movie", ignoreCase = true))
+            "https://player.autoembed.cc/embed/movie/${m.id}"
+        else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            "https://player.autoembed.cc/embed/tv/${m.id}/$s/$e"
+        }
+        return listOfNotNull(resolveEmbed(embed, "https://player.autoembed.cc/", q, "AutoEmbed"))
+    }
+
+    private suspend fun resolveVideasy(m: MediaData, q: Int): List<ExtractorLink> {
+        val embed = if (m.type.equals("movie", ignoreCase = true))
+            "https://player.videasy.net/movie/${m.id}"
+        else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            "https://player.videasy.net/tv/${m.id}/$s/$e"
+        }
+        return listOfNotNull(resolveEmbed(embed, "https://player.videasy.net/", q, "Videasy"))
+    }
+
+    private suspend fun resolveSmashy(m: MediaData, q: Int): List<ExtractorLink> {
+        val embed = if (m.type.equals("movie", ignoreCase = true))
+            "https://player.smashy.stream/movie/${m.id}"
+        else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            "https://player.smashy.stream/tv/${m.id}?season=$s&episode=$e"
+        }
+        return listOfNotNull(resolveEmbed(embed, "https://player.smashy.stream/", q, "Smashy"))
+    }
+
+    /** Runs every external provider in parallel (hard 8s cap), sorted preferred-quality first. */
+    private suspend fun resolveExternalFallback(media: MediaData, preferredQ: Int): List<ExtractorLink> {
+        val raw = withTimeoutOrNull(8_000L) {
+            externalProviders.amap { provider ->
+                runCatching {
+                    provider.servers.flatMap { server -> provider.resolver(media, server, preferredQ) }
+                }.getOrElse { emptyList() }
+            }
+        }?.flatten() ?: emptyList()
+        return raw.sortedBy { link ->
+            if (link.quality == preferredQ) 0
+            else QUALITY_ORDER.indexOf(link.quality).let { idx ->
+                if (idx == -1) Int.MAX_VALUE else idx + 1
+            }
+        }
+    }
+
+    /** Subtitle-only vidy pass (used when playback came from external backups or cache). */
+    private suspend fun fetchVidySubtitlesOnly(
+        media: MediaData,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ) {
+        val seed = try {
+            app.get("$vidyApi/seed?mediaId=${media.id}", headers = vidyHeaders())
+                .parsed<WecollegeSeed>().seed
+        } catch (_: Exception) {
+            null
+        } ?: return
+        val seen = mutableSetOf<String>()
+        for (city in listOf("miami", "boise", "atlanta")) {
+            val payload = getVidyPayload(media, city, seed) ?: continue
+            var emitted = false
+            for (sub in payload.subtitles) {
+                val url = sub.url ?: continue
+                if (seen.add(url)) {
+                    subtitleCallback(newSubtitleFile(sub.label ?: sub.language ?: "Subtitle", url))
+                    emitted = true
+                }
+            }
+            if (emitted) return
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -496,78 +719,110 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         val media = runCatching { mapper.readValue(data, MediaData::class.java) }.getOrNull() ?: return false
         val mediaIdStr = media.id.toString()
         val referer = "https://vidy.st/"
+        val preferredQ = prefInt("quality", 720)
+
+        // ---- Cache hit? (resolved links stay valid ~10 minutes) ----
+        val cacheKey = "$name:${media.id}:${media.type}:${media.season}:${media.episode}:$preferredQ"
+        cacheGet(cacheKey)?.let { cached ->
+            cached.forEach { callback.invoke(it) }
+            backgroundScope.launch {
+                runCatching { fetchVidySubtitlesOnly(media, subtitleCallback) }
+            }
+            return true
+        }
+
+        // Preferred quality first, then QUALITY_ORDER, unknowns last.
+        fun rank(q: Int): Int =
+            if (q == preferredQ) 0
+            else QUALITY_ORDER.indexOf(q).let { idx -> if (idx == -1) Int.MAX_VALUE else idx + 1 }
 
         val seed = try {
             app.get("$vidyApi/seed?mediaId=$mediaIdStr", headers = vidyHeaders())
                 .parsed<WecollegeSeed>().seed
         } catch (e: Exception) {
             null
-        } ?: return false
+        }
 
         // Up to 3 city servers: the first exposes the full per-quality list
-        // (direct media playlists = fast start), the rest are adaptive
+        // (direct media playlists = fast start), the rest are direct
         // fallback sources for CDN errors (ExoPlayer 2004).
         val cities = listOf("miami", "boise", "atlanta", "dallas", "seattle", "phoenix", "portland", "austin")
-        val subtitleUrls = mutableSetOf<String>()
-        var found = false
+        val subtitles = linkedMapOf<String, SubtitleFile>()
+        val links = mutableListOf<ExtractorLink>()
         var added = 0
 
-        for (city in cities) {
-            if (added >= 3) break
-            val payload = getVidyPayload(media, city, seed) ?: continue
-            val cityLabel = city.replaceFirstChar { it.uppercase() }
-
-            if (added == 0) {
-                val order = listOf(720, 1080, 2160, 1440, 480, 360, 240)
+        if (seed != null) {
+            for (city in cities) {
+                if (added >= 3) break
+                val payload = getVidyPayload(media, city, seed) ?: continue
+                val cityLabel = city.replaceFirstChar { it.uppercase() }
                 val sorted = payload.sources
                     .filter { !it.url.isNullOrBlank() }
-                    .sortedBy { src ->
-                        val q = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: -1
-                        order.indexOf(q).let { if (it == -1) order.size else it }
+                    .sortedBy { src -> rank(src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: -1) }
+
+                if (added == 0) {
+                    // Primary city: expose every available quality.
+                    for (src in sorted) {
+                        val url = src.url ?: continue
+                        links.add(
+                            newExtractorLink(name, "$name - $cityLabel ${src.quality ?: "auto"}", url) {
+                                this.quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull()
+                                    ?: Qualities.Unknown.value
+                                this.referer = referer
+                                this.type = ExtractorLinkType.M3U8
+                                this.headers = vidyHeaders()
+                            }
+                        )
                     }
-                for (src in sorted) {
-                    val url = src.url ?: continue
-                    val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
-                    callback.invoke(
-                        newExtractorLink(name, "${name} - $cityLabel ${src.quality ?: "auto"}", url) {
-                            this.quality = quality
+                } else {
+                    // Alt cities: one direct link, preferred quality first.
+                    val alt = sorted.firstOrNull() ?: continue
+                    val url = alt.url ?: continue
+                    links.add(
+                        newExtractorLink(name, "$name - $cityLabel (Alt)", url) {
+                            this.quality = alt.quality?.trimEnd('p', 'P')?.toIntOrNull()
+                                ?: Qualities.Unknown.value
                             this.referer = referer
                             this.type = ExtractorLinkType.M3U8
+                            this.headers = vidyHeaders()
                         }
                     )
-                    found = true
                 }
-            } else {
-                // Alt cities: one direct link, preferring 720p to keep the
-                // default experience consistent (no adaptive Auto track).
-                val altOrder = listOf(720, 1080, 2160, 1440, 480, 360, 240)
-                val altSrc = payload.sources
-                    .filter { !it.url.isNullOrBlank() }
-                    .sortedBy { src ->
-                        val q = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: -1
-                        altOrder.indexOf(q).let { if (it == -1) altOrder.size else it }
-                    }
-                    .firstOrNull() ?: continue
-                callback.invoke(
-                    newExtractorLink(name, "${name} - $cityLabel (Alt)", altSrc.url!!) {
-                        this.quality = altSrc.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: Qualities.Unknown.value
-                        this.referer = referer
-                        this.type = ExtractorLinkType.M3U8
-                    }
-                )
-                found = true
-            }
-            added++
+                added++
 
-            for (sub in payload.subtitles) {
-                val url = sub.url ?: continue
-                if (subtitleUrls.add(url)) {
-                    subtitleCallback.invoke(newSubtitleFile(sub.label ?: sub.language ?: "Subtitle", url))
+                for (sub in payload.subtitles) {
+                    val url = sub.url ?: continue
+                    if (!subtitles.containsKey(url)) {
+                        subtitles[url] = newSubtitleFile(sub.label ?: sub.language ?: "Subtitle", url)
+                    }
                 }
             }
         }
 
-        return found
+        // ---- Safety net: external backup resolvers when vidy fails entirely ----
+        if (links.isEmpty()) {
+            links.addAll(resolveExternalFallback(media, preferredQ))
+            if (links.isNotEmpty()) {
+                backgroundScope.launch {
+                    runCatching { fetchVidySubtitlesOnly(media, subtitleCallback) }
+                }
+            }
+        }
+
+        // ---- Subtitles in background (never delay video start) ----
+        if (subtitles.isNotEmpty()) {
+            val subs = subtitles.values.toList()
+            backgroundScope.launch {
+                subs.forEach { subtitleCallback.invoke(it) }
+            }
+        }
+
+        if (links.isNotEmpty()) {
+            links.forEach { callback.invoke(it) }
+            cachePut(cacheKey, links)
+        }
+
+        return links.isNotEmpty()
     }
 }
 
