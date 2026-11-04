@@ -3,6 +3,49 @@
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+// ============================================================
+//  SHARED INFRASTRUCTURE (file-scoped, shared by all family sites)
+// ============================================================
+
+private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+/** Preferred quality order when no user preference matches. Lower index wins. */
+private val QUALITY_ORDER = listOf(720, 1080, 2160, 1440, 480, 360, 240)
+
+private val appPrefs: SharedPreferences?
+    get() = try {
+        CommonActivity.activity?.getSharedPreferences("OneFlexPrefs", Context.MODE_PRIVATE)
+    } catch (_: Exception) {
+        null
+    }
+
+private fun prefInt(key: String, default: Int): Int =
+    appPrefs?.getInt(key, default) ?: default
+
+/**
+ * Resolved-link cache shared by every family site (10-minute TTL, 64 entries).
+ * Keys include the site name because emitted link labels carry it.
+ */
+private val linkCache = object : LruCache<String, Pair<Long, List<ExtractorLink>>>(64) {}
+
+private fun cacheGet(k: String): List<ExtractorLink>? =
+    linkCache.get(k)?.takeIf { it.first > System.currentTimeMillis() }?.second
+
+private fun cachePut(k: String, links: List<ExtractorLink>) {
+    if (links.isNotEmpty()) {
+        linkCache.put(k, System.currentTimeMillis() + 10 * 60_000L to links)
+    }
+}
+
+/** Fire-and-forget scope so subtitle work never delays video start. */
+private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
 /**
  * One provider instance per 1flex-family site (fubuki's multi-server stack:

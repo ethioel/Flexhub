@@ -67,12 +67,17 @@ subprojects {
 
     dependencies {
         val cloudstream by configurations
+        val compileOnly by configurations
         val implementation by configurations
 
         // OFFICIAL: compile-time stubs for all CloudStream classes (the app provides them at runtime).
         // The old com.github.recloudstream.cloudstream:library:-SNAPSHOT artifact no longer contains
         // the Plugin class, which broke compilation.
         cloudstream("com.lagradost:cloudstream3:pre-release")
+
+        // Coroutine compile stubs — the CloudStream app provides the runtime, so this is
+        // compileOnly (never packaged into the .cs3, avoiding duplicate classes in the app).
+        compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
         implementation(kotlin("stdlib"))
         implementation("com.github.Blatzar:NiceHttp:0.4.11")
