@@ -377,6 +377,10 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         "munich", "berlin", "paris", "delhi", "cancun",
     )
 
+    /** Set when a vidy response comes back as an HTML block page (Cloudflare). */
+    @Volatile
+    private var vidyBlockedHit = false
+
     /**
      * Port of the decryption used by the 1flex/vidy.st family player
      * (obfuscated JS: custom FNV-seeded keystream + "mvm1" magic prefix).
@@ -491,6 +495,13 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
 
         return try {
             val text = app.get("$vidyApi/$city/sources?$query", headers = vidyHeaders()).text
+            val trimmed = text.trimStart()
+            if (trimmed.startsWith("<")) {
+                // Cloudflare WAF or error page, not ciphertext. Flag it so the
+                // city sweep stops hammering the WAF and falls back early.
+                vidyBlockedHit = true
+                return null
+            }
             VidyCipher.decrypt(text, seed, mediaIdStr).let { json ->
                 runCatching { mapper.readValue(json, WecollegePayload::class.java) }.getOrNull()
             }?.takeIf { it.sources.isNotEmpty() || !it.playlist.isNullOrBlank() }
@@ -518,7 +529,6 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     )
 
     private val externalProviders: List<ExternalProvider> = listOf(
-        ExternalProvider("Rivestream", listOf("quasar", "pulsar", "vega", "neutron", "orion")) { m, s, q -> resolveRivestream(m, s, q) },
         ExternalProvider("Vidlink", listOf("default", "alpha", "beta")) { m, s, q -> resolveVidlink(m, s, q) },
         ExternalProvider("Vidsrc", listOf("default")) { m, _, q -> resolveVidsrc(m, q) },
         ExternalProvider("Embed.su", listOf("default")) { m, _, q -> resolveEmbedSu(m, q) },
@@ -558,31 +568,6 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         } catch (_: Exception) {
             null
         }
-    }
-
-    private suspend fun resolveRivestream(m: MediaData, service: String, q: Int): List<ExtractorLink> {
-        val isMovie = m.type.equals("movie", ignoreCase = true)
-        val api = buildString {
-            append("https://www.rivestream.app/api/backendfetch?requestID=")
-            append(if (isMovie) "movieVideoProvider" else "tvVideoProvider")
-            append("&id=${m.id}&service=$service&secretKey=NzJiNjIxMjE=&proxyMode=undefined")
-            if (!isMovie) {
-                val s = m.season ?: return emptyList()
-                val e = m.episode ?: return emptyList()
-                append("&season=$s&episode=$e")
-            }
-        }
-        return withTimeoutOrNull(6_000L) {
-            val body = app.get(api, headers = httpHeaders("https://www.rivestream.app/")).text
-            val url = Regex("\"file\"\\s*:\\s*\"(https?[^\"]+)\"")
-                .find(body)?.groupValues?.get(1) ?: return@withTimeoutOrNull emptyList()
-            listOf(newExtractorLink(name, "$name - Rivestream ($service ${q}p)", url) {
-                this.quality = q
-                this.referer = "https://www.rivestream.app/"
-                this.type = if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                this.headers = httpHeaders("https://www.rivestream.app/")
-            })
-        } ?: emptyList()
     }
 
     private suspend fun resolveVidlink(m: MediaData, server: String, q: Int): List<ExtractorLink> {
@@ -759,7 +744,9 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         var added = 0
 
         if (seed != null) withTimeoutOrNull(20_000L) {
+            vidyBlockedHit = false
             for (city in vidyCities) {
+                if (vidyBlockedHit) break
                 val payload = getVidyPayload(media, city, seed) ?: continue
                 val cityLabel = city.replaceFirstChar { it.uppercase() }
                 val sorted = payload.sources
