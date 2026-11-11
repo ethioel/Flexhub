@@ -536,6 +536,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         ExternalProvider("AutoEmbed", listOf("default")) { m, _, q -> resolveAutoEmbed(m, q) },
         ExternalProvider("Videasy", listOf("default")) { m, _, q -> resolveVideasy(m, q) },
         ExternalProvider("Smashy", listOf("default")) { m, _, q -> resolveSmashy(m, q) },
+        ExternalProvider("Rivestream", listOf("prime")) { m, _, q -> resolveRivestreamProvider(m, q) },
     )
 
     /** Follows the first <iframe> and pulls the first m3u8/mp4 out of it. */
@@ -659,6 +660,145 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         }
         return listOfNotNull(resolveEmbed(embed, "https://player.smashy.stream/", q, "Smashy"))
     }
+
+    private data class RivestreamSource(
+        @JsonProperty("quality") val quality: String? = null,
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("source") val source: String? = null,
+        @JsonProperty("format") val format: String? = null,
+    )
+
+    private data class RivestreamResponse(
+        @JsonProperty("data") val data: RivestreamData? = null,
+    )
+
+    private data class RivestreamData(
+        @JsonProperty("sources") val sources: List<RivestreamSource> = emptyList(),
+        @JsonProperty("captions") val captions: List<Map<String, String>> = emptyList(),
+    )
+
+    private suspend fun resolveRivestreamProvider(m: MediaData, q: Int): List<ExtractorLink> {
+        val url = if (m.type.equals("movie", ignoreCase = true))
+            "https://scrapper.rivestream.app/api/provider?provider=prime&id=${m.id}"
+        else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            "https://scrapper.rivestream.app/api/provider?provider=prime&id=${m.id}&season=$s&episode=$e"
+        }
+        return withTimeoutOrNull(6_000L) {
+            try {
+                val json = app.get(url, headers = httpHeaders("https://scrapper.rivestream.app/")).text
+                val response = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+                    .readValue(json, RivestreamResponse::class.java)
+                val sources = response.data?.sources ?: return@withTimeoutOrNull emptyList()
+                sources.mapNotNull { src ->
+                    val streamUrl = src.url ?: return@mapNotNull null
+                    val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: q
+                    newExtractorLink("Rivestream", "Rivestream - ${src.source ?: "Prime"} (${quality}p)", streamUrl) {
+                        this.quality = quality
+                        this.referer = "https://scrapper.rivestream.app/"
+                        this.type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8
+                                    else ExtractorLinkType.VIDEO
+                        this.headers = httpHeaders("https://scrapper.rivestream.app/")
+                    }
+                }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        } ?: emptyList()
+    }
+
+    // --------------------------------------------------------
+    //  Direct site scrape — fetches THIS provider's own watch
+    //  page and extracts streams straight from its HTML/JS.
+    //  Works per-site (all 34 family sites), independent of
+    //  the shared vidy player API.
+    // --------------------------------------------------------
+
+    private fun siteHeaders(): Map<String, String> = mapOf(
+        "User-Agent" to UA,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.9",
+        "Referer" to "$mainUrl/",
+        "Origin" to mainUrl.trimEnd('/'),
+    )
+
+    private fun watchPageUrl(media: MediaData): String = when {
+        media.type.equals("movie", ignoreCase = true) -> "$mainUrl/movie/${media.id}"
+        else -> "$mainUrl/tv/${media.id}/${media.season ?: 1}/${media.episode ?: 1}"
+    }
+
+    private suspend fun linkFromUrl(url: String, label: String, referer: String, headers: Map<String, String>): ExtractorLink? {
+        val clean = url.replace("\\/", "/").replace("\\u0026", "&")
+        if (!clean.startsWith("http")) return null
+        val isHls = clean.contains(".m3u8") || clean.contains("/hls/")
+        val isMp4 = clean.contains(".mp4")
+        if (!isHls && !isMp4) return null
+        return newExtractorLink(name, label, clean) {
+            this.quality = QUALITY_ORDER.firstOrNull { clean.contains("$it") || clean.contains("${it}p") }
+                ?: Qualities.Unknown.value
+            this.referer = referer
+            this.type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            this.headers = headers
+        }
+    }
+
+    /**
+     * Pulls streams directly out of the site's watch page:
+     * 1. __NEXT_DATA__ JSON blobs (Next.js sites embed player config there)
+     * 2. raw .m3u8/.mp4 urls in inline scripts
+     * 3. player <iframe>s, followed and resolved one level deep
+     */
+    private suspend fun resolveSiteDirect(media: MediaData): List<ExtractorLink> = withTimeoutOrNull(12_000L) {
+        try {
+            val headers = siteHeaders()
+            val html = app.get(watchPageUrl(media), headers = headers).text
+            if (html.length < 500) return@withTimeoutOrNull emptyList()
+
+            val links = mutableListOf<ExtractorLink>()
+            val seenUrls = mutableSetOf<String>()
+
+            suspend fun addUrl(raw: String, tag: String) {
+                val link = linkFromUrl(raw, "$name - $tag", mainUrl, headers) ?: return
+                if (seenUrls.add(link.url)) links.add(link)
+            }
+
+            // 1. Raw stream urls anywhere in the page (scripts, JSON, attrs)
+            Regex("""https?://[^"'\\\s<>]+?\.m3u8[^"'\\\s<>]*""").findAll(html)
+                .forEach { addUrl(it.value, "Direct") }
+            Regex("""https?://[^"'\\\s<>]+?\.mp4[^"'\\\s<>]*""").findAll(html)
+                .forEach { addUrl(it.value, "Direct") }
+
+            // 2. __NEXT_DATA__ / embedded JSON config: hunt source/url fields
+            if (links.isEmpty()) {
+                Regex(""""(?:source|stream|file|play_url|video_url|embed_url)"\s*:\s*"(https?://[^"]{20,500})"""")
+                    .findAll(html).forEach { addUrl(it.groupValues[1], "Direct") }
+            }
+
+            // 3. Player iframes (skip same-site/ads), resolved one level deep
+            if (links.isEmpty()) {
+                val iframes = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
+                    .findAll(html)
+                    .map { it.groupValues[1] }
+                    .map { src ->
+                        if (src.startsWith("http")) src
+                        else mainUrl.trimEnd('/') + "/" + src.trimStart('/')
+                    }
+                    .filter { it.startsWith("http") }
+                    .distinctBy { runCatching { java.net.URI(it).host }.getOrDefault(it) }
+                    .take(3)
+                    .toList()
+                for (iframe in iframes) {
+                    val resolved = resolveEmbed(iframe, mainUrl, Qualities.Unknown.value, "Site") ?: continue
+                    if (seenUrls.add(resolved.url)) links.add(resolved)
+                }
+            }
+
+            links
+        } catch (_: Exception) {
+            emptyList()
+        }
+    } ?: emptyList()
 
     /** Runs every external provider in parallel (hard 8s cap), sorted preferred-quality first. */
     private suspend fun resolveExternalFallback(media: MediaData, preferredQ: Int): List<ExtractorLink> {
@@ -792,7 +932,12 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             }
         }
 
-        // ---- Safety net: external backup resolvers when vidy fails entirely ----
+        // ---- Tier 2: scrape this site's own watch page directly ----
+        if (links.isEmpty()) {
+            links.addAll(resolveSiteDirect(media))
+        }
+
+        // ---- Tier 3: external backup resolvers when vidy + site both fail ----
         if (links.isEmpty()) {
             links.addAll(resolveExternalFallback(media, preferredQ))
             if (links.isNotEmpty()) {
