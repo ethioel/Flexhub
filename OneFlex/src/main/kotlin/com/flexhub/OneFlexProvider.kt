@@ -531,6 +531,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     )
 
     private val externalProviders: List<ExternalProvider> = listOf(
+        ExternalProvider("OneFlex", listOf("web")) { m, _, q -> resolveRivestreamWebPlayer(m, q) },
         ExternalProvider("Vidlink", listOf("default")) { m, _, q -> resolveVidlink(m, "default", q) },
         ExternalProvider("Vidsrc", listOf("default")) { m, _, q -> resolveVidsrc(m, q) },
         ExternalProvider("Embed.su", listOf("default")) { m, _, q -> resolveEmbedSu(m, q) },
@@ -542,126 +543,317 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         ExternalProvider("OneFlex", listOf("prime")) { m, _, q -> resolveRivestreamProvider(m, q) },
     )
 
-    /** Follows the first <iframe> and pulls the first m3u8/mp4 out of it. */
-    private suspend fun resolveEmbed(
+    private suspend fun resolveVidlink(m: MediaData, server: String, q: Int): List<ExtractorLink> {
+        val urls = if (m.type.equals("movie", ignoreCase = true)) {
+            listOf(
+                "https://vidlink.pro/api/b/movie/${m.id}",
+                "https://vidlink.org/api/b/movie/${m.id}",
+            )
+        } else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            listOf(
+                "https://vidlink.pro/api/b/tv/${m.id}/$s/$e",
+                "https://vidlink.org/api/b/tv/${m.id}/$s/$e",
+            )
+        }
+        for (url in urls) {
+            val result = withTimeoutOrNull(8_000L) {
+                try {
+                    val json = app.get(url, headers = httpHeaders("https://vidlink.pro/")).text
+                    val playlist = Regex("\"playlist\"\\s*:\\s*\"(https?[^\"]+)\"")
+                        .find(json)?.groupValues?.get(1)
+                        ?: Regex("\"file\"\\s*:\\s*\"(https?[^\"]+)\"")
+                            .find(json)?.groupValues?.get(1)
+                        ?: Regex("\"url\"\\s*:\\s*\"(https?[^\"]+)\"")
+                            .find(json)?.groupValues?.get(1)
+                        ?: return@withTimeoutOrNull null
+                    val verified = verifyUpstreamChain(playlist)
+                    if (!verified) return@withTimeoutOrNull null
+                    listOf(newExtractorLink(name, "$name - Vidlink (${q}p)", playlist) {
+                        this.quality = q
+                        this.referer = "https://vidlink.pro/"
+                        this.type = ExtractorLinkType.M3U8
+                        this.headers = httpHeaders("https://vidlink.pro/")
+                    })
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            if (result != null && result.isNotEmpty()) return result
+        }
+        return emptyList()
+    }
+
+    /** Follows iframe chain up to 3 hops to find m3u8/mp4. */
+    private suspend fun resolveEmbedChain(
         embedUrl: String,
         embedReferer: String,
         quality: Int,
         tag: String,
-    ): ExtractorLink? = withTimeoutOrNull(6_000L) {
+        extraHeaders: Map<String, String> = emptyMap(),
+    ): ExtractorLink? = withTimeoutOrNull(15_000L) {
         try {
-            val headers = httpHeaders(embedReferer)
-            val html = app.get(embedUrl, headers = headers).text
-            val iframeSrc = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
-                .find(html)?.groupValues?.get(1) ?: return@withTimeoutOrNull null
-            val iframeUrl = if (iframeSrc.startsWith("http")) iframeSrc
-                else embedReferer.trimEnd('/') + "/" + iframeSrc.trimStart('/')
-            val iframeHtml = app.get(iframeUrl, headers = headers).text
-            val streamUrl = Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""")
-                .find(iframeHtml)?.groupValues?.get(1)
-                ?: Regex("""(https?://[^"'\s\\]+\.mp4[^"'\s\\]*)""")
-                    .find(iframeHtml)?.groupValues?.get(1)
-                ?: return@withTimeoutOrNull null
-            newExtractorLink(name, "$name - $tag (${quality}p)", streamUrl) {
+            var currentUrl = embedUrl
+            var currentReferer = embedReferer
+            var finalStreamUrl: String? = null
+            var finalReferer = currentReferer
+
+            var hops = 0
+            while (hops < 3) {
+                hops++
+                val pageHeaders = httpHeaders(currentReferer) + extraHeaders
+                val pageHtml = app.get(currentUrl, headers = pageHeaders).text
+
+                // Look for m3u8/mp4 directly in page
+                val streamUrl = Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""")
+                    .find(pageHtml)?.groupValues?.get(1)
+                    ?: Regex("""(https?://[^"'\s\\]+\.mp4[^"'\s\\]*)""")
+                        .find(pageHtml)?.groupValues?.get(1)
+                if (streamUrl != null) {
+                    finalStreamUrl = streamUrl
+                    finalReferer = currentReferer
+                    break
+                }
+
+                // Look for nested iframe
+                val nextIframe = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
+                    .find(pageHtml)?.groupValues?.get(1)
+                if (nextIframe == null) break
+                val nextUrl = if (nextIframe.startsWith("http")) nextIframe
+                    else currentReferer.trimEnd('/') + "/" + nextIframe.trimStart('/')
+                currentReferer = currentUrl
+                currentUrl = nextUrl
+            }
+
+            if (finalStreamUrl == null) return@withTimeoutOrNull null
+
+            val verified = verifyUpstreamChain(finalStreamUrl)
+            if (!verified) return@withTimeoutOrNull null
+
+            newExtractorLink(name, "$name - $tag (${quality}p)", finalStreamUrl!!) {
                 this.quality = quality
-                this.referer = embedReferer
-                this.type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8
+                this.referer = finalReferer
+                this.type = if (finalStreamUrl!!.contains(".m3u8")) ExtractorLinkType.M3U8
                             else ExtractorLinkType.VIDEO
-                this.headers = headers
+                this.headers = httpHeaders(finalReferer) + extraHeaders
             }
         } catch (_: Exception) {
             null
         }
     }
 
-    private suspend fun resolveVidlink(m: MediaData, server: String, q: Int): List<ExtractorLink> {
-        val url = if (m.type.equals("movie", ignoreCase = true))
-            "https://vidlink.pro/api/b/movie/${m.id}"
-        else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            "https://vidlink.pro/api/b/tv/${m.id}/$s/$e"
-        }
-        return withTimeoutOrNull(6_000L) {
-            val json = app.get(url, headers = httpHeaders("https://vidlink.pro/")).text
-            val playlist = Regex("\"playlist\"\\s*:\\s*\"(https?[^\"]+)\"")
-                .find(json)?.groupValues?.get(1)
-                ?: Regex("\"file\"\\s*:\\s*\"(https?[^\"]+)\"")
-                    .find(json)?.groupValues?.get(1)
-                ?: return@withTimeoutOrNull emptyList()
-            listOf(newExtractorLink(name, "$name - Vidlink ($server ${q}p)", playlist) {
-                this.quality = q
-                this.referer = "https://vidlink.pro/"
-                this.type = ExtractorLinkType.M3U8
-                this.headers = httpHeaders("https://vidlink.pro/")
-            })
-        } ?: emptyList()
-    }
-
     private suspend fun resolveVidsrc(m: MediaData, q: Int): List<ExtractorLink> {
-        val embed = if (m.type.equals("movie", ignoreCase = true))
-            "https://vidsrc.to/embed/movie/${m.id}"
-        else {
+        val embedDomains = listOf(
+            "https://vidsrc.xyz/embed/movie/${m.id}",
+            "https://vidsrc.me/embed/movie/${m.id}",
+            "https://vidsrc.to/embed/movie/${m.id}",
+        )
+        val tvEmbedDomains = listOf(
+            "https://vidsrc.xyz/embed/tv/${m.id}/${m.season}/${m.episode}",
+            "https://vidsrc.me/embed/tv/${m.id}/${m.season}/${m.episode}",
+            "https://vidsrc.to/embed/tv/${m.id}/${m.season}/${m.episode}",
+        )
+        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
             val s = m.season ?: return emptyList()
             val e = m.episode ?: return emptyList()
-            "https://vidsrc.to/embed/tv/${m.id}/$s/$e"
+            tvEmbedDomains
         }
-        return listOfNotNull(resolveEmbed(embed, "https://vidsrc.to/", q, "Vidsrc"))
+        for (url in urls) {
+            val referer = url.substringBefore("/embed")
+            val result = resolveEmbedChain(url, referer + "/", q, "Vidsrc",
+                mapOf("Referer" to referer + "/", "Origin" to referer))
+            if (result != null) return listOf(result)
+        }
+        return emptyList()
     }
 
     private suspend fun resolveEmbedSu(m: MediaData, q: Int): List<ExtractorLink> {
-        val embed = if (m.type.equals("movie", ignoreCase = true))
-            "https://embed.su/embed/movie/${m.id}"
-        else {
+        val embedDomains = listOf(
+            "https://embed.su/embed/movie/${m.id}",
+            "https://multiembed.mov/embed/movie/${m.id}",
+        )
+        val tvEmbedDomains = listOf(
+            "https://embed.su/embed/tv/${m.id}/${m.season}/${m.episode}",
+            "https://multiembed.mov/embed/tv/${m.id}/${m.season}/${m.episode}",
+        )
+        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
             val s = m.season ?: return emptyList()
             val e = m.episode ?: return emptyList()
-            "https://embed.su/embed/tv/${m.id}/$s/$e"
+            tvEmbedDomains
         }
-        return listOfNotNull(resolveEmbed(embed, "https://embed.su/", q, "Embed.su"))
+        for (url in urls) {
+            val referer = url.substringBefore("/embed")
+            val result = resolveEmbedChain(url, referer + "/", q, "Embed.su",
+                mapOf("Referer" to referer + "/", "Origin" to referer))
+            if (result != null) return listOf(result)
+        }
+        return emptyList()
     }
 
     private suspend fun resolve2Embed(m: MediaData, q: Int): List<ExtractorLink> {
-        val embed = if (m.type.equals("movie", ignoreCase = true))
-            "https://www.2embed.cc/embed/${m.id}"
-        else {
+        val imdbId = m.imdb ?: return emptyList()
+        if (!imdbId.startsWith("tt")) return emptyList()
+        val embedDomains = listOf(
+            "https://www.2embed.cc/embed/$imdbId",
+            "https://www.2embed.ru/embed/$imdbId",
+        )
+        val tvEmbedDomains = listOf(
+            "https://www.2embed.cc/embedtv/$imdbId&s=${m.season}&e=${m.episode}",
+            "https://www.2embed.ru/embedtv/$imdbId&s=${m.season}&e=${m.episode}",
+        )
+        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
             val s = m.season ?: return emptyList()
             val e = m.episode ?: return emptyList()
-            "https://www.2embed.cc/embedtv/${m.id}&s=$s&e=$e"
+            tvEmbedDomains
         }
-        return listOfNotNull(resolveEmbed(embed, "https://www.2embed.cc/", q, "2Embed"))
+        for (url in urls) {
+            val referer = "https://www.2embed.cc/"
+            val result = resolveEmbedChain(url, referer, q, "2Embed",
+                mapOf("Referer" to referer, "Origin" to "https://www.2embed.cc"))
+            if (result != null) return listOf(result)
+        }
+        return emptyList()
     }
 
     private suspend fun resolveAutoEmbed(m: MediaData, q: Int): List<ExtractorLink> {
-        val embed = if (m.type.equals("movie", ignoreCase = true))
-            "https://player.autoembed.cc/embed/movie/${m.id}"
-        else {
+        val embedDomains = listOf(
+            "https://player.autoembed.cc/embed/movie/${m.id}",
+            "https://autoembed.cc/embed/movie/${m.id}",
+        )
+        val tvEmbedDomains = listOf(
+            "https://player.autoembed.cc/embed/tv/${m.id}/${m.season}/${m.episode}",
+            "https://autoembed.cc/embed/tv/${m.id}/${m.season}/${m.episode}",
+        )
+        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
             val s = m.season ?: return emptyList()
             val e = m.episode ?: return emptyList()
-            "https://player.autoembed.cc/embed/tv/${m.id}/$s/$e"
+            tvEmbedDomains
         }
-        return listOfNotNull(resolveEmbed(embed, "https://player.autoembed.cc/", q, "AutoEmbed"))
+        for (url in urls) {
+            val referer = url.substringBefore("/embed")
+            val result = resolveEmbedChain(url, referer + "/", q, "AutoEmbed",
+                mapOf("Referer" to referer + "/", "Origin" to referer))
+            if (result != null) return listOf(result)
+        }
+        return emptyList()
     }
 
     private suspend fun resolveVideasy(m: MediaData, q: Int): List<ExtractorLink> {
-        val embed = if (m.type.equals("movie", ignoreCase = true))
-            "https://player.videasy.net/movie/${m.id}"
-        else {
+        val embedDomains = listOf(
+            "https://player.videasy.net/movie/${m.id}",
+            "https://videasy.net/movie/${m.id}",
+        )
+        val tvEmbedDomains = listOf(
+            "https://player.videasy.net/tv/${m.id}/${m.season}/${m.episode}",
+            "https://videasy.net/tv/${m.id}/${m.season}/${m.episode}",
+        )
+        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
             val s = m.season ?: return emptyList()
             val e = m.episode ?: return emptyList()
-            "https://player.videasy.net/tv/${m.id}/$s/$e"
+            tvEmbedDomains
         }
-        return listOfNotNull(resolveEmbed(embed, "https://player.videasy.net/", q, "Videasy"))
+        for (url in urls) {
+            val referer = url.substringBefore("/movie").substringBefore("/tv")
+            val result = resolveEmbedChain(url, referer, q, "Videasy",
+                mapOf("Referer" to referer, "Origin" to referer))
+            if (result != null) return listOf(result)
+        }
+        return emptyList()
     }
 
     private suspend fun resolveSmashy(m: MediaData, q: Int): List<ExtractorLink> {
-        val embed = if (m.type.equals("movie", ignoreCase = true))
-            "https://player.smashy.stream/movie/${m.id}"
+        val embedDomains = listOf(
+            "https://player.smashy.stream/movie/${m.id}",
+            "https://smashy.stream/movie/${m.id}",
+        )
+        val tvEmbedDomains = listOf(
+            "https://player.smashy.stream/tv/${m.id}/${m.season}/${m.episode}",
+            "https://smashy.stream/tv/${m.id}/${m.season}/${m.episode}",
+        )
+        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            tvEmbedDomains
+        }
+        for (url in urls) {
+            val referer = url.substringBefore("/movie").substringBefore("/tv")
+            val result = resolveEmbedChain(url, referer, q, "Smashy",
+                mapOf("Referer" to referer, "Origin" to referer))
+            if (result != null) return listOf(result)
+        }
+        return emptyList()
+    }
+
+    /**
+     * Rivestream web player iframe chain: watch.rivestream.app -> cloudorchestranova.com -> vsembed.ru -> stream.
+     * This is the actual working playback path used by the web player and Android TV apps.
+     */
+    private suspend fun resolveRivestreamWebPlayer(m: MediaData, q: Int): List<ExtractorLink> {
+        val baseUrl = "https://watch.rivestream.app"
+        val embedUrl = if (m.type.equals("movie", ignoreCase = true))
+            "$baseUrl/movie/${m.id}"
         else {
             val s = m.season ?: return emptyList()
             val e = m.episode ?: return emptyList()
-            "https://player.smashy.stream/tv/${m.id}?season=$s&episode=$e"
+            "$baseUrl/tv/${m.id}/$s/$e"
         }
-        return listOfNotNull(resolveEmbed(embed, "https://player.smashy.stream/", q, "Smashy"))
+        return withTimeoutOrNull(20_000L) {
+            try {
+                val headers = httpHeaders(baseUrl)
+                val html = app.get(embedUrl, headers = headers).text
+                val iframeSrc = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
+                    .find(html)?.groupValues?.get(1) ?: return@withTimeoutOrNull emptyList()
+                var currentUrl = if (iframeSrc.startsWith("http")) iframeSrc
+                    else baseUrl + "/" + iframeSrc.trimStart('/')
+                var currentReferer = baseUrl
+                var finalStreamUrl: String? = null
+                var finalReferer = currentReferer
+
+                // Follow iframe chain up to 3 hops: cloudorchestranova.com -> vsembed.ru -> stream
+                var hops = 0
+                while (hops < 3) {
+                    hops++
+                    val pageHeaders = httpHeaders(currentReferer)
+                    val pageHtml = app.get(currentUrl, headers = pageHeaders).text
+
+                    // Look for m3u8/mp4 directly in page
+                    val streamUrl = Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""")
+                        .find(pageHtml)?.groupValues?.get(1)
+                        ?: Regex("""(https?://[^"'\s\\]+\.mp4[^"'\s\\]*)""")
+                            .find(pageHtml)?.groupValues?.get(1)
+                    if (streamUrl != null) {
+                        finalStreamUrl = streamUrl
+                        finalReferer = currentReferer
+                        break
+                    }
+
+                    // Look for nested iframe
+                    val nextIframe = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
+                        .find(pageHtml)?.groupValues?.get(1)
+                    if (nextIframe == null) break
+                    val nextUrl = if (nextIframe.startsWith("http")) nextIframe
+                        else currentReferer.trimEnd('/') + "/" + nextIframe.trimStart('/')
+                    currentReferer = currentUrl
+                    currentUrl = nextUrl
+                }
+
+                if (finalStreamUrl == null) return@withTimeoutOrNull emptyList()
+
+                val verified = verifyUpstreamChain(finalStreamUrl)
+                if (!verified) return@withTimeoutOrNull emptyList()
+
+                listOf(newExtractorLink("OneFlex", "OneFlex - Rivestream Web (${q}p)", finalStreamUrl!!) {
+                    this.quality = q
+                    this.referer = finalReferer
+                    this.type = if (finalStreamUrl!!.contains(".m3u8")) ExtractorLinkType.M3U8
+                                else ExtractorLinkType.VIDEO
+                    this.headers = httpHeaders(finalReferer)
+                })
+            } catch (_: Exception) {
+                emptyList()
+            }
+        } ?: emptyList()
     }
 
     private data class RivestreamSource(
@@ -978,7 +1170,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                     .take(3)
                     .toList()
                 for (iframe in iframes) {
-                    val resolved = resolveEmbed(iframe, mainUrl, Qualities.Unknown.value, "Site") ?: continue
+                    val resolved = resolveEmbedChain(iframe, mainUrl, Qualities.Unknown.value, "Site") ?: continue
                     if (seenUrls.add(resolved.url)) links.add(resolved)
                 }
             }
