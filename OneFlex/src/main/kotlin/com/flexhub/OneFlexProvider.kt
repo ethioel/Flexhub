@@ -536,7 +536,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         ExternalProvider("AutoEmbed", listOf("default")) { m, _, q -> resolveAutoEmbed(m, q) },
         ExternalProvider("Videasy", listOf("default")) { m, _, q -> resolveVideasy(m, q) },
         ExternalProvider("Smashy", listOf("default")) { m, _, q -> resolveSmashy(m, q) },
-        ExternalProvider("Rivestream", listOf("prime")) { m, _, q -> resolveRivestreamProvider(m, q) },
+        ExternalProvider("OneFlex", listOf("prime")) { m, _, q -> resolveRivestreamProvider(m, q) },
     )
 
     /** Follows the first <iframe> and pulls the first m3u8/mp4 out of it. */
@@ -712,31 +712,44 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             val e = m.episode ?: return emptyList()
             "https://scrapper.rivestream.app/api/provider?provider=prime&id=${m.id}&season=$s&episode=$e"
         }
-        return withTimeoutOrNull(10_000L) {
+        return withTimeoutOrNull(12_000L) {
             try {
                 val json = app.get(url, headers = httpHeaders("https://www.rivestream.app/")).text
                 val response = mapper.readValue(json, RivestreamResponse::class.java)
                 val sources = response.data?.sources ?: return@withTimeoutOrNull emptyList()
-                val out = mutableListOf<ExtractorLink>()
-                val seen = mutableSetOf<String>()
+
+                // upstream -> (server name, quality), first quality wins per upstream
+                val candidates = linkedMapOf<String, Pair<String, Int>>()
                 for (src in sources) {
                     val upstream = rivestreamUpstream(src.url ?: continue) ?: continue
-                    if (!seen.add(upstream)) continue
                     val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: q
-                    val label = buildString {
-                        append(src.source ?: "Rivestream")
-                        append(" (").append(quality).append("p)")
+                    if (!candidates.containsKey(upstream)) {
+                        candidates[upstream] = (src.source ?: "Server") to quality
                     }
-                    out.add(
-                        newExtractorLink(name, "$name - Rivestream $label", upstream) {
-                            this.quality = quality
-                            this.referer = "https://www.rivestream.app/"
-                            this.type = ExtractorLinkType.M3U8
-                            this.headers = mapOf("User-Agent" to UA, "Referer" to "https://www.rivestream.app/")
-                        }
-                    )
                 }
-                out
+
+                // Verify every playlist before exposing it — expired tokens
+                // return 404/403 and surface as player error 2004.
+                val candidateList: List<Pair<String, Pair<String, Int>>> = candidates.toList()
+                val verified: List<Pair<String, Pair<String, Int>>> = candidateList.amap { candidate ->
+                    runCatching {
+                        val ok = app.get(candidate.first, headers = mapOf("User-Agent" to UA))
+                            .text.trimStart().startsWith("#EXTM3U")
+                        if (ok) listOf(candidate) else emptyList()
+                    }.getOrDefault(emptyList())
+                }.flatten()
+
+                verified.map { link ->
+                    val upstream = link.first
+                    val server = link.second.first
+                    val quality = link.second.second
+                    newExtractorLink("OneFlex", "OneFlex - $server (${quality}p)", upstream) {
+                        this.quality = quality
+                        this.referer = ""
+                        this.type = ExtractorLinkType.M3U8
+                        this.headers = mapOf("User-Agent" to UA)
+                    }
+                }
             } catch (_: Exception) {
                 emptyList()
             }
@@ -1001,7 +1014,6 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
 
 
 // Alt domains are noted per site; they serve identical catalogs, so each site
-// is registered once. 1Shows / 1Tube / 1shows.bz are alts of 1Flex.
 class OneFlexProvider : FlexhubFamilyProvider("1Flex (Flexhub)", "https://www.1flex.org") // alts: www.1shows.org, www.1tube.org, 1shows.bz
 class AniCineProvider : FlexhubFamilyProvider("AniCine (Flexhub)", "https://anicine.sbs") // alt: anicine.xyz
 class ZetMoonProvider : FlexhubFamilyProvider("ZetMoon (Flexhub)", "https://zetmoon.live")
