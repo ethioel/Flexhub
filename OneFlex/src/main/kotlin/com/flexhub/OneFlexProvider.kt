@@ -6,6 +6,8 @@ import android.util.LruCache
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.extractors.ByseSX
+import com.lagradost.cloudstream3.extractors.StreamTape
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -536,6 +538,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         ExternalProvider("AutoEmbed", listOf("default")) { m, _, q -> resolveAutoEmbed(m, q) },
         ExternalProvider("Videasy", listOf("default")) { m, _, q -> resolveVideasy(m, q) },
         ExternalProvider("Smashy", listOf("default")) { m, _, q -> resolveSmashy(m, q) },
+        ExternalProvider("OneFlex", listOf("self")) { m, _, q -> resolveRivestreamEmbed(m, q) },
         ExternalProvider("OneFlex", listOf("prime")) { m, _, q -> resolveRivestreamProvider(m, q) },
     )
 
@@ -704,6 +707,133 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         if (decoded.startsWith("http")) decoded else inner
     }.getOrNull()
 
+    private data class RivestreamEmbedSource(
+        @JsonProperty("host") val host: String? = null,
+        @JsonProperty("link") val link: String? = null,
+    )
+
+    private data class RivestreamEmbedData(
+        @JsonProperty("sources") val sources: List<RivestreamEmbedSource> = emptyList(),
+    )
+
+    private data class RivestreamEmbedResponse(
+        @JsonProperty("data") val data: RivestreamEmbedData? = null,
+    )
+
+    /**
+     * The "self" provider lists file-host embeds (byse.sx family, streamtape).
+     * The bundled CloudStream extractors decode them to direct streams.
+     */
+    private suspend fun resolveRivestreamEmbed(m: MediaData, q: Int): List<ExtractorLink> {
+        val url = if (m.type.equals("movie", ignoreCase = true))
+            "https://scrapper.rivestream.app/api/embed?provider=self&id=${m.id}"
+        else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            "https://scrapper.rivestream.app/api/embed?provider=self&id=${m.id}&season=$s&episode=$e"
+        }
+        return withTimeoutOrNull(15_000L) {
+            try {
+                val json = app.get(url, headers = httpHeaders("https://www.rivestream.app/")).text
+                val response = mapper.readValue(json, RivestreamEmbedResponse::class.java)
+                val sources = response.data?.sources ?: return@withTimeoutOrNull emptyList()
+
+                val perSource: List<List<Pair<ExtractorLink, Pair<String, Int>>>> = sources.amap { src ->
+                    val link = src.link ?: return@amap emptyList()
+                    val host = runCatching { java.net.URI(link).host }.getOrDefault("")
+                    if (host.isBlank()) return@amap emptyList()
+                    val parsedQ = src.host?.let {
+                        Regex("""(\d{3,4})""").find(it)?.groupValues?.get(1)?.toIntOrNull()
+                    } ?: -1
+                    val serverName = src.host?.substringBefore("-")?.replaceFirstChar { it.uppercase() }
+                        ?: host.substringBefore(".")
+                    val collected = mutableListOf<ExtractorLink>()
+                    runCatching {
+                        when {
+                            host.contains("streamtape") ->
+                                StreamTape().getUrl(link).orEmpty().forEach { collected.add(it) }
+                            host.contains("byse") ->
+                                ByseSX().getUrl(link, "", { _ -> }, { collected.add(it) })
+                        }
+                    }
+                    collected.map { it to (serverName to parsedQ) }
+                }
+
+                perSource.flatten().map { (el, meta) ->
+                    val (serverName, parsedQ) = meta
+                    val qLabel = if (parsedQ > 0) "(${parsedQ}p)" else "(auto)"
+                    newExtractorLink("OneFlex", "OneFlex - $serverName $qLabel", el.url) {
+                        this.quality = if (parsedQ in 1..2160) parsedQ else Qualities.Unknown.value
+                        this.referer = el.referer
+                        this.type = el.type
+                        this.headers = el.headers
+                        this.extractorData = el.extractorData
+                    }
+                }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        } ?: emptyList()
+    }
+
+    private fun resolveRelativeUrl(base: String, url: String): String =
+        if (url.startsWith("http")) url
+        else runCatching { java.net.URI(base).resolve(url).toString() }.getOrDefault(url)
+
+    private val imageMagic: (ByteArray) -> Boolean = { head ->
+        val png = head.size >= 4 && head[0] == 0x89.toByte() && head[1] == 0x50.toByte()
+        val gif = head.size >= 3 && head[0] == 0x47.toByte() && head[1] == 0x49.toByte()
+        val jpg = head.size >= 2 && head[0] == 0xFF.toByte() && head[1] == 0xD8.toByte()
+        val riff = head.size >= 4 && head[0] == 0x52.toByte() && head[1] == 0x49.toByte() &&
+            head[2] == 0x46.toByte() && head[3] == 0x46.toByte()
+        png || gif || jpg || riff
+    }
+
+    private data class PlaylistCheck(
+        val ok: Boolean,
+        val isMaster: Boolean,
+        val lines: List<String> = emptyList(),
+    )
+
+    private suspend fun playlistCheck(url: String): PlaylistCheck {
+        val res = runCatching { app.get(url, headers = mapOf("User-Agent" to UA)) }.getOrNull()
+            ?: return PlaylistCheck(false, false)
+        if (res.code != 200) return PlaylistCheck(false, false)
+        val text = res.text.trimStart()
+        if (!text.startsWith("#EXTM3U")) return PlaylistCheck(false, false)
+        val lines = text.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
+        if (lines.isEmpty()) return PlaylistCheck(false, false)
+        return PlaylistCheck(true, text.contains("#EXT-X-STREAM-INF"), lines)
+    }
+
+    /**
+     * Verifies the FULL playback chain: master -> (variant) -> first segment.
+     * Some upstreams serve ad-image playlists whose segments all return 4xx or
+     * are literally PNG/JPEG ad slides — those break the player with error
+     * 2004, so they must never be exposed.
+     */
+    private suspend fun verifyUpstreamChain(upstream: String): Boolean = runCatching {
+        val master = playlistCheck(upstream)
+        if (!master.ok) return@runCatching false
+
+        var playlistUrl = upstream
+        var segments = master.lines
+        if (master.isMaster) {
+            val variantUrl = resolveRelativeUrl(upstream, master.lines.first())
+            val variant = playlistCheck(variantUrl)
+            if (!variant.ok) return@runCatching false
+            playlistUrl = variantUrl
+            segments = variant.lines
+        }
+
+        val segUrl = resolveRelativeUrl(playlistUrl, segments.first())
+        val seg = app.get(segUrl, headers = mapOf("User-Agent" to UA, "Range" to "bytes=0-2047"))
+        if (seg.code != 200 && seg.code != 206) return@runCatching false
+        val head = seg.body?.bytes() ?: return@runCatching false
+        if (head.isEmpty()) return@runCatching false
+        !imageMagic(head)
+    }.getOrDefault(false)
+
     private suspend fun resolveRivestreamProvider(m: MediaData, q: Int): List<ExtractorLink> {
         val url = if (m.type.equals("movie", ignoreCase = true))
             "https://scrapper.rivestream.app/api/provider?provider=prime&id=${m.id}"
@@ -712,7 +842,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             val e = m.episode ?: return emptyList()
             "https://scrapper.rivestream.app/api/provider?provider=prime&id=${m.id}&season=$s&episode=$e"
         }
-        return withTimeoutOrNull(12_000L) {
+        return withTimeoutOrNull(15_000L) {
             try {
                 val json = app.get(url, headers = httpHeaders("https://www.rivestream.app/")).text
                 val response = mapper.readValue(json, RivestreamResponse::class.java)
@@ -728,15 +858,10 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                     }
                 }
 
-                // Verify every playlist before exposing it — expired tokens
-                // return 404/403 and surface as player error 2004.
+                // Verify every playback chain before exposing it.
                 val candidateList: List<Pair<String, Pair<String, Int>>> = candidates.toList()
                 val verified: List<Pair<String, Pair<String, Int>>> = candidateList.amap { candidate ->
-                    runCatching {
-                        val ok = app.get(candidate.first, headers = mapOf("User-Agent" to UA))
-                            .text.trimStart().startsWith("#EXTM3U")
-                        if (ok) listOf(candidate) else emptyList()
-                    }.getOrDefault(emptyList())
+                    if (verifyUpstreamChain(candidate.first)) listOf(candidate) else emptyList()
                 }.flatten()
 
                 verified.map { link ->
@@ -771,9 +896,20 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         "Origin" to mainUrl.trimEnd('/'),
     )
 
-    private fun watchPageUrl(media: MediaData): String = when {
-        media.type.equals("movie", ignoreCase = true) -> "$mainUrl/movie/${media.id}"
-        else -> "$mainUrl/tv/${media.id}/${media.season ?: 1}/${media.episode ?: 1}"
+    /** Real watch paths vary across the family: /movie/{id} (SPA) vs /watch/movie/{id} (SSR). */
+    private fun watchPageUrls(media: MediaData): List<String> = when {
+        media.type.equals("movie", ignoreCase = true) -> listOf(
+            "$mainUrl/watch/movie/${media.id}",
+            "$mainUrl/movie/${media.id}",
+        )
+        else -> {
+            val s = media.season ?: 1
+            val e = media.episode ?: 1
+            listOf(
+                "$mainUrl/watch/tv/${media.id}/$s/$e",
+                "$mainUrl/tv/${media.id}/$s/$e",
+            )
+        }
     }
 
     private suspend fun linkFromUrl(url: String, label: String, referer: String, headers: Map<String, String>): ExtractorLink? {
@@ -800,8 +936,13 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     private suspend fun resolveSiteDirect(media: MediaData): List<ExtractorLink> = withTimeoutOrNull(12_000L) {
         try {
             val headers = siteHeaders()
-            val html = app.get(watchPageUrl(media), headers = headers).text
-            if (html.length < 500) return@withTimeoutOrNull emptyList()
+            // First watch-path variant that returns a real page wins.
+            var html = ""
+            for (candidate in watchPageUrls(media)) {
+                val page = runCatching { app.get(candidate, headers = headers).text }.getOrDefault("")
+                if (page.length > 1000) { html = page; break }
+            }
+            if (html.length < 1000) return@withTimeoutOrNull emptyList()
 
             val links = mutableListOf<ExtractorLink>()
             val seenUrls = mutableSetOf<String>()
