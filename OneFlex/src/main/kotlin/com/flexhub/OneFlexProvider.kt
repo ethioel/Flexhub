@@ -529,7 +529,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     )
 
     private val externalProviders: List<ExternalProvider> = listOf(
-        ExternalProvider("Vidlink", listOf("default", "alpha", "beta")) { m, s, q -> resolveVidlink(m, s, q) },
+        ExternalProvider("Vidlink", listOf("default")) { m, _, q -> resolveVidlink(m, "default", q) },
         ExternalProvider("Vidsrc", listOf("default")) { m, _, q -> resolveVidsrc(m, q) },
         ExternalProvider("Embed.su", listOf("default")) { m, _, q -> resolveEmbedSu(m, q) },
         ExternalProvider("2Embed", listOf("default")) { m, _, q -> resolve2Embed(m, q) },
@@ -677,6 +677,33 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         @JsonProperty("captions") val captions: List<Map<String, String>> = emptyList(),
     )
 
+    private fun queryParams(raw: String): Map<String, String> =
+        raw.split('&').mapNotNull { part ->
+            val i = part.indexOf('=')
+            if (i <= 0) null
+            else runCatching {
+                java.net.URLDecoder.decode(part.substring(0, i), "UTF-8") to
+                    java.net.URLDecoder.decode(part.substring(i + 1), "UTF-8")
+            }.getOrNull()
+        }.toMap()
+
+    /**
+     * Rivestream wraps every stream in proxy.valhallastream.com, which rejects
+     * direct access (403). The real upstream is hidden inside:
+     * proxy?url=<inner>&headers=...  where inner may carry u=<base64 upstream>.
+     */
+    private fun rivestreamUpstream(proxyUrl: String): String? = runCatching {
+        val outer = queryParams(java.net.URI(proxyUrl).rawQuery ?: "")
+        val inner = outer["url"] ?: return null
+        val innerQuery = runCatching { java.net.URI(inner).rawQuery }.getOrNull()
+        if (innerQuery.isNullOrBlank()) return inner
+        val b64 = queryParams(innerQuery)["u"] ?: return inner
+        val padded = b64.replace(" ", "+").replace('-', '+').replace('_', '/') +
+            "=".repeat((4 - b64.length % 4) % 4)
+        val decoded = String(android.util.Base64.decode(padded, android.util.Base64.DEFAULT), Charsets.UTF_8)
+        if (decoded.startsWith("http")) decoded else inner
+    }.getOrNull()
+
     private suspend fun resolveRivestreamProvider(m: MediaData, q: Int): List<ExtractorLink> {
         val url = if (m.type.equals("movie", ignoreCase = true))
             "https://scrapper.rivestream.app/api/provider?provider=prime&id=${m.id}"
@@ -685,23 +712,31 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             val e = m.episode ?: return emptyList()
             "https://scrapper.rivestream.app/api/provider?provider=prime&id=${m.id}&season=$s&episode=$e"
         }
-        return withTimeoutOrNull(6_000L) {
+        return withTimeoutOrNull(10_000L) {
             try {
-                val json = app.get(url, headers = httpHeaders("https://scrapper.rivestream.app/")).text
-                val response = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
-                    .readValue(json, RivestreamResponse::class.java)
+                val json = app.get(url, headers = httpHeaders("https://www.rivestream.app/")).text
+                val response = mapper.readValue(json, RivestreamResponse::class.java)
                 val sources = response.data?.sources ?: return@withTimeoutOrNull emptyList()
-                sources.mapNotNull { src ->
-                    val streamUrl = src.url ?: return@mapNotNull null
+                val out = mutableListOf<ExtractorLink>()
+                val seen = mutableSetOf<String>()
+                for (src in sources) {
+                    val upstream = rivestreamUpstream(src.url ?: continue) ?: continue
+                    if (!seen.add(upstream)) continue
                     val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: q
-                    newExtractorLink("Rivestream", "Rivestream - ${src.source ?: "Prime"} (${quality}p)", streamUrl) {
-                        this.quality = quality
-                        this.referer = "https://scrapper.rivestream.app/"
-                        this.type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8
-                                    else ExtractorLinkType.VIDEO
-                        this.headers = httpHeaders("https://scrapper.rivestream.app/")
+                    val label = buildString {
+                        append(src.source ?: "Rivestream")
+                        append(" (").append(quality).append("p)")
                     }
+                    out.add(
+                        newExtractorLink(name, "$name - Rivestream $label", upstream) {
+                            this.quality = quality
+                            this.referer = "https://www.rivestream.app/"
+                            this.type = ExtractorLinkType.M3U8
+                            this.headers = mapOf("User-Agent" to UA, "Referer" to "https://www.rivestream.app/")
+                        }
+                    )
                 }
+                out
             } catch (_: Exception) {
                 emptyList()
             }
@@ -800,9 +835,9 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         }
     } ?: emptyList()
 
-    /** Runs every external provider in parallel (hard 8s cap), sorted preferred-quality first. */
+    /** Runs every external provider in parallel (hard 20s cap), sorted preferred-quality first. */
     private suspend fun resolveExternalFallback(media: MediaData, preferredQ: Int): List<ExtractorLink> {
-        val raw = withTimeoutOrNull(8_000L) {
+        val raw = withTimeoutOrNull(20_000L) {
             externalProviders.amap { provider ->
                 runCatching {
                     provider.servers.flatMap { server -> provider.resolver(media, server, preferredQ) }
