@@ -25,6 +25,11 @@ private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
 /** Preferred quality order when no user preference matches. Lower index wins. */
 private val QUALITY_ORDER = listOf(720, 1080, 2160, 1440, 480, 360, 240)
 
+/** Diagnostics for logcat (tag OneFlex) — never throws. */
+private fun logDiag(message: String) {
+    runCatching { android.util.Log.d("OneFlex", message) }
+}
+
 private val appPrefs: SharedPreferences?
     get() = try {
         CommonActivity.activity?.getSharedPreferences("OneFlexPrefs", Context.MODE_PRIVATE)
@@ -531,77 +536,24 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     )
 
     private val externalProviders: List<ExternalProvider> = listOf(
-        ExternalProvider("OneFlex", listOf("web")) { m, _, q -> resolveRivestreamWebPlayer(m, q) },
-        ExternalProvider("Vidlink", listOf("default")) { m, _, q -> resolveVidlink(m, "default", q) },
         ExternalProvider("Vsembed", listOf("default")) { m, _, q -> resolveVsembed(m, q) },
-        ExternalProvider("Vidsrc", listOf("default")) { m, _, q -> resolveVidsrc(m, q) },
-        ExternalProvider("Embed.su", listOf("default")) { m, _, q -> resolveEmbedSu(m, q) },
-        ExternalProvider("2Embed", listOf("default")) { m, _, q -> resolve2Embed(m, q) },
-        ExternalProvider("AutoEmbed", listOf("default")) { m, _, q -> resolveAutoEmbed(m, q) },
-        ExternalProvider("Videasy", listOf("default")) { m, _, q -> resolveVideasy(m, q) },
-        ExternalProvider("Smashy", listOf("default")) { m, _, q -> resolveSmashy(m, q) },
         ExternalProvider("OneFlex", listOf("self")) { m, _, q -> resolveRivestreamEmbed(m, q) },
         ExternalProvider("OneFlex", listOf("prime")) { m, _, q -> resolveRivestreamProvider(m, q) },
     )
 
-    private suspend fun resolveVidlink(m: MediaData, server: String, q: Int): List<ExtractorLink> {
-        val urls = if (m.type.equals("movie", ignoreCase = true)) {
-            listOf(
-                "https://vidlink.pro/api/b/movie/${m.id}",
-                "https://vidlink.org/api/b/movie/${m.id}",
-            )
-        } else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            listOf(
-                "https://vidlink.pro/api/b/tv/${m.id}/$s/$e",
-                "https://vidlink.org/api/b/tv/${m.id}/$s/$e",
-            )
-        }
-        for (url in urls) {
-            val result = withTimeoutOrNull(8_000L) {
-                try {
-                    val json = app.get(url, headers = httpHeaders("https://vidlink.pro/")).text
-                    val playlist = Regex("\"playlist\"\\s*:\\s*\"(https?[^\"]+)\"")
-                        .find(json)?.groupValues?.get(1)
-                        ?: Regex("\"file\"\\s*:\\s*\"(https?[^\"]+)\"")
-                            .find(json)?.groupValues?.get(1)
-                        ?: Regex("\"url\"\\s*:\\s*\"(https?[^\"]+)\"")
-                            .find(json)?.groupValues?.get(1)
-                        ?: return@withTimeoutOrNull null
-                    val verified = verifyUpstreamChain(playlist)
-                    if (!verified) return@withTimeoutOrNull null
-                    listOf(newExtractorLink(name, "$name - Vidlink (${q}p)", playlist) {
-                        this.quality = q
-                        this.referer = "https://vidlink.pro/"
-                        this.type = ExtractorLinkType.M3U8
-                        this.headers = httpHeaders("https://vidlink.pro/")
-                    })
-                } catch (_: Exception) {
-                    null
-                }
-            }
-            if (result != null && result.isNotEmpty()) return result
-        }
-        return emptyList()
-    }
 
     private data class VsembedApiData(
-        @JsonProperty("title") val title: String? = null,
         @JsonProperty("file_name") val fileName: String? = null,
-        @JsonProperty("stream_urls_api_host") val streamUrlsApiHost: String? = null,
         // String (encrypted, protection on) or List<String> (plain, protection off)
         @JsonProperty("stream_urls") val streamUrls: Any? = null,
     )
 
     private data class VsembedVs(
-        @JsonProperty("w") val w: Long? = null,
         @JsonProperty("wasm_url") val wasmUrl: String? = null,
         @JsonProperty("wasm") val wasm: String? = null,
     )
 
     private data class VsembedApiResponse(
-        @JsonProperty("status_code") val statusCode: String? = null,
         @JsonProperty("data") val data: VsembedApiData? = null,
         @JsonProperty("vs") val vs: VsembedVs? = null,
     )
@@ -644,20 +596,26 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                 "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
                 "Referer" to "https://vsembed.ru/",
             )
-            val embedHtml = app.get(embedUrl, headers = embedHeaders).text
+            val embedRes = app.get(embedUrl, headers = embedHeaders)
+            logDiag("vsembed embed page ${embedRes.code} $embedUrl")
+            val embedHtml = embedRes.text
             val dataApi = Regex("""data-api=["']([^"']+)["']""")
-                .find(embedHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
+                .find(embedHtml)?.groupValues?.get(1)?.replace("&" + "amp;", "&")
                 ?: return@withTimeoutOrNull emptyList()
             val vsSrcUrl = if (dataApi.startsWith("http")) dataApi else "https://vsembed.ru$dataApi"
 
             // Step 2: vs_src.php -> {"src": "..."} with exact embed referer
-            val srcJson = app.get(vsSrcUrl, headers = httpHeaders(embedUrl)).text
+            val srcRes = app.get(vsSrcUrl, headers = httpHeaders(embedUrl))
+            logDiag("vsembed vs_src ${srcRes.code} $vsSrcUrl")
+            val srcJson = srcRes.text
             val innerUrl = Regex(""""src"\s*:\s*"([^"]+)"""")
                 .find(srcJson)?.groupValues?.get(1)
                 ?: return@withTimeoutOrNull emptyList()
 
             // Step 3: outer embed page -> CFG.playerUrl
-            val outerHtml = app.get(innerUrl, headers = httpHeaders(embedUrl)).text
+            val outerRes = app.get(innerUrl, headers = httpHeaders(embedUrl))
+            logDiag("vsembed outer ${outerRes.code} $innerUrl")
+            val outerHtml = outerRes.text
             val playerPath = Regex(""""playerUrl"\s*:\s*"([^"]+)"""")
                 .find(outerHtml)?.groupValues?.get(1)?.replace("\\u0026", "&")
                 ?: return@withTimeoutOrNull emptyList()
@@ -666,7 +624,9 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                 .getOrDefault("https://stellarconductornexus.com")
 
             // Step 4: player page -> CONFIG (api for movies, streamBase for tv) + apiToken
-            val playerHtml = app.get(playerUrl, headers = httpHeaders(innerUrl)).text
+            val playerRes = app.get(playerUrl, headers = httpHeaders(innerUrl))
+            logDiag("vsembed player ${playerRes.code} $playerUrl")
+            val playerHtml = playerRes.text
             val cfg = Regex("""CONFIG\s*=\s*(\{.*?\})\s*;""").find(playerHtml)?.groupValues?.get(1)
                 ?: return@withTimeoutOrNull emptyList()
 
@@ -704,7 +664,9 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                 "Referer" to playerUrl,
                 "Origin" to playerOrigin,
             )
-            val apiJson = app.get("$requestUrl&api_token=$apiToken", headers = apiHeaders).text
+            val apiRes = app.get("$requestUrl&api_token=$apiToken", headers = apiHeaders)
+            logDiag("vsembed stream_urls ${apiRes.code} $requestUrl")
+            val apiJson = apiRes.text
 
             val apiResponse = runCatching { mapper.readValue(apiJson, VsembedApiResponse::class.java) }
                 .getOrNull()
@@ -739,7 +701,11 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                 }
                 else -> emptyList()
             }
-            if (urls.isEmpty()) return@withTimeoutOrNull emptyList()
+            if (urls.isEmpty()) {
+                logDiag("vsembed: no stream urls decrypted")
+                return@withTimeoutOrNull emptyList()
+            }
+            logDiag("vsembed decrypted ${urls.size} urls")
 
             // Step 8: per-host playlist token (JWT) from the stream host
             val streamHost = runCatching { java.net.URI(urls.first()).let { "${it.scheme}://${it.host}" } }
@@ -758,6 +724,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                     .find(tokText)?.groupValues?.get(1) ?: tokText
                 else tokText
             }.getOrDefault("")
+            logDiag("vsembed token length ${playlistToken.length} host $streamHost")
 
             val fileName = apiResponse.data?.fileName ?: ""
             val parsedQ = Regex("""(\d{3,4})p""").find(fileName)?.groupValues?.get(1)?.toIntOrNull() ?: q
@@ -765,22 +732,50 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
 
             // The stream hosts sit behind a CDN that rejects browser-less requests:
             // the playlist (and every segment) needs the player's Referer/Origin.
-            val playHeaders = mapOf(
-                "User-Agent" to UA,
-                "Referer" to playerUrl,
-                "Origin" to playerOrigin,
+            val headerSets = listOf(
+                mapOf(
+                    "User-Agent" to UA,
+                    "Referer" to playerUrl,
+                    "Origin" to playerOrigin,
+                    "Accept" to "*/*",
+                    "Accept-Language" to "en-US,en;q=0.9",
+                    "Sec-Fetch-Dest" to "empty",
+                    "Sec-Fetch-Mode" to "cors",
+                    "Sec-Fetch-Site" to "cross-site",
+                ),
+                mapOf("User-Agent" to UA, "Referer" to playerUrl, "Origin" to playerOrigin),
+                mapOf("User-Agent" to UA, "Referer" to playerUrl),
+                mapOf("User-Agent" to UA, "Origin" to playerOrigin),
+                mapOf("User-Agent" to UA, "Referer" to innerUrl),
             )
 
-            urls.mapIndexedNotNull { idx, url ->
-                // The host rejects the bare playlist ("no token"), so the per-host
-                // token is mandatory; the signed path alone never plays.
-                val finalUrl = when {
+            val candidates = urls.map { url ->
+                when {
                     url.contains("__TOKEN__") -> url.replace("__TOKEN__", playlistToken)
                     playlistToken.isBlank() -> url
                     url.contains('?') -> "$url&token=$playlistToken"
                     else -> "$url?token=$playlistToken"
                 }
-                if (!verifyUpstreamChain(finalUrl, playHeaders)) return@mapIndexedNotNull null
+            }
+
+            // Probe once to learn which header set the CDN accepts, reuse for all URLs.
+            var workingHeaders: Map<String, String>? = null
+            for (headers in headerSets) {
+                val probe = runCatching { app.get(candidates.first(), headers = headers) }.getOrNull()
+                val code = probe?.code ?: -1
+                val body = probe?.text?.trimStart().orEmpty()
+                logDiag("vsembed probe ${headers.keys} -> $code")
+                if (code == 200 && body.startsWith("#EXTM3U")) {
+                    workingHeaders = headers
+                    break
+                }
+            }
+            val emitHeaders = workingHeaders ?: headerSets.first()
+            if (workingHeaders == null) logDiag("vsembed: no header set accepted, emitting best effort")
+
+            candidates.mapIndexedNotNull { idx, finalUrl ->
+                val verified = workingHeaders != null && verifyUpstreamChain(finalUrl, emitHeaders)
+                if (!verified) logDiag("vsembed link $idx not verified: $finalUrl")
                 newExtractorLink(
                     "OneFlex",
                     "OneFlex - Vsembed ${idx + 1} (${labelQ}p)",
@@ -789,7 +784,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                     this.quality = labelQ
                     this.referer = playerUrl
                     this.type = ExtractorLinkType.M3U8
-                    this.headers = playHeaders
+                    this.headers = emitHeaders
                 }
             }
         } catch (_: Exception) {
@@ -797,277 +792,11 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         }
     } ?: emptyList()
 
-    /** Classic vidsrc.xyz embed fallback, kept as a second independent source. */
-    private suspend fun resolveVidsrc(m: MediaData, q: Int): List<ExtractorLink> {
-        val embedDomains = listOf(
-            "https://vidsrc.xyz/embed/movie/${m.id}",
-            "https://vidsrc.me/embed/movie/${m.id}",
-            "https://vidsrc.to/embed/movie/${m.id}",
-        )
-        val tvEmbedDomains = listOf(
-            "https://vidsrc.xyz/embed/tv/${m.id}/${m.season}/${m.episode}",
-            "https://vidsrc.me/embed/tv/${m.id}/${m.season}/${m.episode}",
-            "https://vidsrc.to/embed/tv/${m.id}/${m.season}/${m.episode}",
-        )
-        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            tvEmbedDomains
-        }
-        for (url in urls) {
-            val referer = url.substringBefore("/embed")
-            val result = resolveEmbedChain(url, referer + "/", q, "Vidsrc",
-                mapOf("Referer" to referer + "/", "Origin" to referer))
-            if (result != null) return listOf(result)
-        }
-        return emptyList()
-    }
 
-    /** Follows iframe chain up to 3 hops to find m3u8/mp4. */
-    private suspend fun resolveEmbedChain(
-        embedUrl: String,
-        embedReferer: String,
-        quality: Int,
-        tag: String,
-        extraHeaders: Map<String, String> = emptyMap(),
-    ): ExtractorLink? = withTimeoutOrNull(15_000L) {
-        try {
-            var currentUrl = embedUrl
-            var currentReferer = embedReferer
-            var finalStreamUrl: String? = null
-            var finalReferer = currentReferer
 
-            var hops = 0
-            while (hops < 3) {
-                hops++
-                val pageHeaders = httpHeaders(currentReferer) + extraHeaders
-                val pageHtml = app.get(currentUrl, headers = pageHeaders).text
 
-                // Look for m3u8/mp4 directly in page
-                val streamUrl = Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""")
-                    .find(pageHtml)?.groupValues?.get(1)
-                    ?: Regex("""(https?://[^"'\s\\]+\.mp4[^"'\s\\]*)""")
-                        .find(pageHtml)?.groupValues?.get(1)
-                if (streamUrl != null) {
-                    finalStreamUrl = streamUrl
-                    finalReferer = currentReferer
-                    break
-                }
 
-                // Look for nested iframe
-                val nextIframe = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
-                    .find(pageHtml)?.groupValues?.get(1)
-                if (nextIframe == null) break
-                val nextUrl = if (nextIframe.startsWith("http")) nextIframe
-                    else currentReferer.trimEnd('/') + "/" + nextIframe.trimStart('/')
-                currentReferer = currentUrl
-                currentUrl = nextUrl
-            }
 
-            if (finalStreamUrl == null) return@withTimeoutOrNull null
-
-            val verified = verifyUpstreamChain(finalStreamUrl)
-            if (!verified) return@withTimeoutOrNull null
-
-            newExtractorLink(name, "$name - $tag (${quality}p)", finalStreamUrl!!) {
-                this.quality = quality
-                this.referer = finalReferer
-                this.type = if (finalStreamUrl!!.contains(".m3u8")) ExtractorLinkType.M3U8
-                            else ExtractorLinkType.VIDEO
-                this.headers = httpHeaders(finalReferer) + extraHeaders
-            }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private suspend fun resolveEmbedSu(m: MediaData, q: Int): List<ExtractorLink> {
-        val embedDomains = listOf(
-            "https://embed.su/embed/movie/${m.id}",
-            "https://multiembed.mov/embed/movie/${m.id}",
-        )
-        val tvEmbedDomains = listOf(
-            "https://embed.su/embed/tv/${m.id}/${m.season}/${m.episode}",
-            "https://multiembed.mov/embed/tv/${m.id}/${m.season}/${m.episode}",
-        )
-        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            tvEmbedDomains
-        }
-        for (url in urls) {
-            val referer = url.substringBefore("/embed")
-            val result = resolveEmbedChain(url, referer + "/", q, "Embed.su",
-                mapOf("Referer" to referer + "/", "Origin" to referer))
-            if (result != null) return listOf(result)
-        }
-        return emptyList()
-    }
-
-    private suspend fun resolve2Embed(m: MediaData, q: Int): List<ExtractorLink> {
-        val imdbId = m.imdb ?: return emptyList()
-        if (!imdbId.startsWith("tt")) return emptyList()
-        val embedDomains = listOf(
-            "https://www.2embed.cc/embed/$imdbId",
-            "https://www.2embed.ru/embed/$imdbId",
-        )
-        val tvEmbedDomains = listOf(
-            "https://www.2embed.cc/embedtv/$imdbId&s=${m.season}&e=${m.episode}",
-            "https://www.2embed.ru/embedtv/$imdbId&s=${m.season}&e=${m.episode}",
-        )
-        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            tvEmbedDomains
-        }
-        for (url in urls) {
-            val referer = "https://www.2embed.cc/"
-            val result = resolveEmbedChain(url, referer, q, "2Embed",
-                mapOf("Referer" to referer, "Origin" to "https://www.2embed.cc"))
-            if (result != null) return listOf(result)
-        }
-        return emptyList()
-    }
-
-    private suspend fun resolveAutoEmbed(m: MediaData, q: Int): List<ExtractorLink> {
-        val embedDomains = listOf(
-            "https://player.autoembed.cc/embed/movie/${m.id}",
-            "https://autoembed.cc/embed/movie/${m.id}",
-        )
-        val tvEmbedDomains = listOf(
-            "https://player.autoembed.cc/embed/tv/${m.id}/${m.season}/${m.episode}",
-            "https://autoembed.cc/embed/tv/${m.id}/${m.season}/${m.episode}",
-        )
-        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            tvEmbedDomains
-        }
-        for (url in urls) {
-            val referer = url.substringBefore("/embed")
-            val result = resolveEmbedChain(url, referer + "/", q, "AutoEmbed",
-                mapOf("Referer" to referer + "/", "Origin" to referer))
-            if (result != null) return listOf(result)
-        }
-        return emptyList()
-    }
-
-    private suspend fun resolveVideasy(m: MediaData, q: Int): List<ExtractorLink> {
-        val embedDomains = listOf(
-            "https://player.videasy.net/movie/${m.id}",
-            "https://videasy.net/movie/${m.id}",
-        )
-        val tvEmbedDomains = listOf(
-            "https://player.videasy.net/tv/${m.id}/${m.season}/${m.episode}",
-            "https://videasy.net/tv/${m.id}/${m.season}/${m.episode}",
-        )
-        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            tvEmbedDomains
-        }
-        for (url in urls) {
-            val referer = url.substringBefore("/movie").substringBefore("/tv")
-            val result = resolveEmbedChain(url, referer, q, "Videasy",
-                mapOf("Referer" to referer, "Origin" to referer))
-            if (result != null) return listOf(result)
-        }
-        return emptyList()
-    }
-
-    private suspend fun resolveSmashy(m: MediaData, q: Int): List<ExtractorLink> {
-        val embedDomains = listOf(
-            "https://player.smashy.stream/movie/${m.id}",
-            "https://smashy.stream/movie/${m.id}",
-        )
-        val tvEmbedDomains = listOf(
-            "https://player.smashy.stream/tv/${m.id}/${m.season}/${m.episode}",
-            "https://smashy.stream/tv/${m.id}/${m.season}/${m.episode}",
-        )
-        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            tvEmbedDomains
-        }
-        for (url in urls) {
-            val referer = url.substringBefore("/movie").substringBefore("/tv")
-            val result = resolveEmbedChain(url, referer, q, "Smashy",
-                mapOf("Referer" to referer, "Origin" to referer))
-            if (result != null) return listOf(result)
-        }
-        return emptyList()
-    }
-
-    /**
-     * Rivestream web player iframe chain: watch.rivestream.app -> cloudorchestranova.com -> vsembed.ru -> stream.
-     * This is the actual working playback path used by the web player and Android TV apps.
-     */
-    private suspend fun resolveRivestreamWebPlayer(m: MediaData, q: Int): List<ExtractorLink> {
-        val baseUrl = "https://watch.rivestream.app"
-        val embedUrl = if (m.type.equals("movie", ignoreCase = true))
-            "$baseUrl/movie/${m.id}"
-        else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            "$baseUrl/tv/${m.id}/$s/$e"
-        }
-        return withTimeoutOrNull(20_000L) {
-            try {
-                val headers = httpHeaders(baseUrl)
-                val html = app.get(embedUrl, headers = headers).text
-                val iframeSrc = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
-                    .find(html)?.groupValues?.get(1) ?: return@withTimeoutOrNull emptyList()
-                var currentUrl = if (iframeSrc.startsWith("http")) iframeSrc
-                    else baseUrl + "/" + iframeSrc.trimStart('/')
-                var currentReferer = baseUrl
-                var finalStreamUrl: String? = null
-                var finalReferer = currentReferer
-
-                // Follow iframe chain up to 3 hops: cloudorchestranova.com -> vsembed.ru -> stream
-                var hops = 0
-                while (hops < 3) {
-                    hops++
-                    val pageHeaders = httpHeaders(currentReferer)
-                    val pageHtml = app.get(currentUrl, headers = pageHeaders).text
-
-                    // Look for m3u8/mp4 directly in page
-                    val streamUrl = Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""")
-                        .find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""(https?://[^"'\s\\]+\.mp4[^"'\s\\]*)""")
-                            .find(pageHtml)?.groupValues?.get(1)
-                    if (streamUrl != null) {
-                        finalStreamUrl = streamUrl
-                        finalReferer = currentReferer
-                        break
-                    }
-
-                    // Look for nested iframe
-                    val nextIframe = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
-                        .find(pageHtml)?.groupValues?.get(1)
-                    if (nextIframe == null) break
-                    val nextUrl = if (nextIframe.startsWith("http")) nextIframe
-                        else currentReferer.trimEnd('/') + "/" + nextIframe.trimStart('/')
-                    currentReferer = currentUrl
-                    currentUrl = nextUrl
-                }
-
-                if (finalStreamUrl == null) return@withTimeoutOrNull emptyList()
-
-                val verified = verifyUpstreamChain(finalStreamUrl)
-                if (!verified) return@withTimeoutOrNull emptyList()
-
-                listOf(newExtractorLink("OneFlex", "OneFlex - Rivestream Web (${q}p)", finalStreamUrl!!) {
-                    this.quality = q
-                    this.referer = finalReferer
-                    this.type = if (finalStreamUrl!!.contains(".m3u8")) ExtractorLinkType.M3U8
-                                else ExtractorLinkType.VIDEO
-                    this.headers = httpHeaders(finalReferer)
-                })
-            } catch (_: Exception) {
-                emptyList()
-            }
-        } ?: emptyList()
-    }
 
     private data class RivestreamSource(
         @JsonProperty("quality") val quality: String? = null,
@@ -1299,108 +1028,9 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     //  the shared vidy player API.
     // --------------------------------------------------------
 
-    private fun siteHeaders(): Map<String, String> = mapOf(
-        "User-Agent" to UA,
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language" to "en-US,en;q=0.9",
-        "Referer" to "$mainUrl/",
-        "Origin" to mainUrl.trimEnd('/'),
-    )
 
-    /** Real watch paths vary across the family: /movie/{id} (SPA) vs /watch/movie/{id} (SSR). */
-    private fun watchPageUrls(media: MediaData): List<String> = when {
-        media.type.equals("movie", ignoreCase = true) -> listOf(
-            "$mainUrl/watch/movie/${media.id}",
-            "$mainUrl/movie/${media.id}",
-        )
-        else -> {
-            val s = media.season ?: 1
-            val e = media.episode ?: 1
-            listOf(
-                "$mainUrl/watch/tv/${media.id}/$s/$e",
-                "$mainUrl/tv/${media.id}/$s/$e",
-            )
-        }
-    }
 
-    private suspend fun linkFromUrl(url: String, label: String, referer: String, headers: Map<String, String>): ExtractorLink? {
-        val clean = url.replace("\\/", "/").replace("\\u0026", "&")
-        if (!clean.startsWith("http")) return null
-        val isHls = clean.contains(".m3u8") || clean.contains("/hls/")
-        val isMp4 = clean.contains(".mp4")
-        if (!isHls && !isMp4) return null
-        return newExtractorLink(name, label, clean) {
-            this.quality = QUALITY_ORDER.firstOrNull { clean.contains("$it") || clean.contains("${it}p") }
-                ?: Qualities.Unknown.value
-            this.referer = referer
-            this.type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-            this.headers = headers
-        }
-    }
 
-    /**
-     * Pulls streams directly out of the site's watch page:
-     * 1. __NEXT_DATA__ JSON blobs (Next.js sites embed player config there)
-     * 2. raw .m3u8/.mp4 urls in inline scripts
-     * 3. player <iframe>s, followed and resolved one level deep
-     */
-    private suspend fun resolveSiteDirect(media: MediaData): List<ExtractorLink> = withTimeoutOrNull(12_000L) {
-        try {
-            val headers = siteHeaders()
-            // First watch-path variant that returns a real page wins.
-            var html = ""
-            for (candidate in watchPageUrls(media)) {
-                val page = runCatching { app.get(candidate, headers = headers).text }.getOrDefault("")
-                if (page.length > 1000) { html = page; break }
-            }
-            if (html.length < 1000) return@withTimeoutOrNull emptyList()
-
-            val links = mutableListOf<ExtractorLink>()
-            val seenUrls = mutableSetOf<String>()
-
-            suspend fun addUrl(raw: String, tag: String) {
-                val link = linkFromUrl(raw, "$name - $tag", mainUrl, headers) ?: return
-                if (seenUrls.add(link.url)) links.add(link)
-            }
-
-            // 1. Raw stream urls anywhere in the page (scripts, JSON, attrs)
-            Regex("""https?://[^"'\\\s<>]+?\.m3u8[^"'\\\s<>]*""").findAll(html)
-                .forEach { addUrl(it.value, "Direct") }
-            Regex("""https?://[^"'\\\s<>]+?\.mp4[^"'\\\s<>]*""").findAll(html)
-                .forEach { addUrl(it.value, "Direct") }
-
-            // 2. __NEXT_DATA__ / embedded JSON config: hunt source/url fields
-            if (links.isEmpty()) {
-                Regex(""""(?:source|stream|file|play_url|video_url|embed_url)"\s*:\s*"(https?://[^"]{20,500})"""")
-                    .findAll(html).forEach { addUrl(it.groupValues[1], "Direct") }
-            }
-
-            // 3. Player iframes (skip same-site/ads), resolved one level deep
-            if (links.isEmpty()) {
-                val iframes = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
-                    .findAll(html)
-                    .map { it.groupValues[1] }
-                    .map { src ->
-                        if (src.startsWith("http")) src
-                        else mainUrl.trimEnd('/') + "/" + src.trimStart('/')
-                    }
-                    .filter { it.startsWith("http") }
-                    .distinctBy { runCatching { java.net.URI(it).host }.getOrDefault(it) }
-                    .take(3)
-                    .toList()
-                for (iframe in iframes) {
-                    val resolved = resolveEmbedChain(iframe, mainUrl, Qualities.Unknown.value, "Site") ?: continue
-                    if (seenUrls.add(resolved.url)) links.add(resolved)
-                }
-            }
-
-            links
-        } catch (_: Exception) {
-            emptyList()
-        }
-    } ?: emptyList()
-
-    /** Runs every external provider in parallel (hard 60s cap), sorted preferred-quality first. */
     private suspend fun resolveExternalFallback(media: MediaData, preferredQ: Int): List<ExtractorLink> {
         val raw = withTimeoutOrNull(60_000L) {
             externalProviders.amap { provider ->
@@ -1566,14 +1196,10 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             }
         }
 
-        // ---- Tier 2: scrape this site's own watch page directly ----
-        if (links.isEmpty()) {
-            links.addAll(resolveSiteDirect(media))
-        }
-
-        // ---- Tier 3: external backup resolvers when vidy + site both fail ----
+        // ---- Tier 2: external backup resolvers when vidy fails ----
         if (links.isEmpty()) {
             links.addAll(resolveExternalFallback(media, preferredQ))
+            logDiag("loadLinks tier2 external -> ${links.size}")
             if (links.isNotEmpty()) {
                 backgroundScope.launch {
                     runCatching { fetchVidySubtitlesOnly(media, subtitleCallback) }
