@@ -533,6 +533,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     private val externalProviders: List<ExternalProvider> = listOf(
         ExternalProvider("OneFlex", listOf("web")) { m, _, q -> resolveRivestreamWebPlayer(m, q) },
         ExternalProvider("Vidlink", listOf("default")) { m, _, q -> resolveVidlink(m, "default", q) },
+        ExternalProvider("Vsembed", listOf("default")) { m, _, q -> resolveVsembed(m, q) },
         ExternalProvider("Vidsrc", listOf("default")) { m, _, q -> resolveVidsrc(m, q) },
         ExternalProvider("Embed.su", listOf("default")) { m, _, q -> resolveEmbedSu(m, q) },
         ExternalProvider("2Embed", listOf("default")) { m, _, q -> resolve2Embed(m, q) },
@@ -581,6 +582,243 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                 }
             }
             if (result != null && result.isNotEmpty()) return result
+        }
+        return emptyList()
+    }
+
+    private data class VsembedApiData(
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("file_name") val fileName: String? = null,
+        @JsonProperty("stream_urls_api_host") val streamUrlsApiHost: String? = null,
+        // String (encrypted, protection on) or List<String> (plain, protection off)
+        @JsonProperty("stream_urls") val streamUrls: Any? = null,
+    )
+
+    private data class VsembedVs(
+        @JsonProperty("w") val w: Long? = null,
+        @JsonProperty("wasm_url") val wasmUrl: String? = null,
+        @JsonProperty("wasm") val wasm: String? = null,
+    )
+
+    private data class VsembedApiResponse(
+        @JsonProperty("status_code") val statusCode: String? = null,
+        @JsonProperty("data") val data: VsembedApiData? = null,
+        @JsonProperty("vs") val vs: VsembedVs? = null,
+    )
+
+    /** Decodes base64 that may be URL-safe, un-padded or contain whitespace. */
+    private fun decodeB64(value: String): ByteArray? = runCatching {
+        val clean = value.trim()
+            .filter { !it.isWhitespace() }
+            .replace('-', '+')
+            .replace('_', '/')
+        val pad = (4 - clean.length % 4) % 4
+        android.util.Base64.decode(clean + "=".repeat(pad), android.util.Base64.DEFAULT)
+    }.getOrNull()
+
+    /**
+     * Vsembed chain (the vidsrc.sh family player, fully verified live):
+     *  1. vsembed.ru embed page -> <iframe data-api="/vs_src.php?...">
+     *  2. vs_src.php -> {"src": "https://<host>/embed/{movie,tv}/...?vs=..."}
+     *  3. outer embed page (Referer = vsembed embed URL) -> CFG.playerUrl
+     *  4. player page (Referer = outer URL) -> CONFIG: api/streamBase + apiToken
+     *  5. metaApi -> data.stream_urls_api_host (pool host)
+     *  6. stream_urls API + &api_token= (single-use) -> encrypted blob + vs.wasm_url
+     *  7. WASM decrypt (VsWasm interpreter) -> newline URL list
+     *  8. <stream host>/generate.php?api_token= -> playlist JWT (?token= covers
+     *     the whole playlist chain; variant/segment URLs come back pre-stamped)
+     */
+    private suspend fun resolveVsembed(m: MediaData, q: Int): List<ExtractorLink> = withTimeoutOrNull(25_000L) {
+        try {
+            val embedUrl = if (m.type.equals("movie", ignoreCase = true))
+                "https://vsembed.ru/embed/movie/${m.id}"
+            else {
+                val s = m.season ?: return@withTimeoutOrNull emptyList()
+                val e = m.episode ?: return@withTimeoutOrNull emptyList()
+                "https://vsembed.ru/embed/tv/${m.id}/$s/$e"
+            }
+
+            // Step 1: embed page -> data-api attr (HTML-escaped &amp;)
+            val embedHeaders = mapOf(
+                "User-Agent" to UA,
+                "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Referer" to "https://vsembed.ru/",
+            )
+            val embedHtml = app.get(embedUrl, headers = embedHeaders).text
+            val dataApi = Regex("""data-api=["']([^"']+)["']""")
+                .find(embedHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
+                ?: return@withTimeoutOrNull emptyList()
+            val vsSrcUrl = if (dataApi.startsWith("http")) dataApi else "https://vsembed.ru$dataApi"
+
+            // Step 2: vs_src.php -> {"src": "..."} with exact embed referer
+            val srcJson = app.get(vsSrcUrl, headers = httpHeaders(embedUrl)).text
+            val innerUrl = Regex(""""src"\s*:\s*"([^"]+)"""")
+                .find(srcJson)?.groupValues?.get(1)
+                ?: return@withTimeoutOrNull emptyList()
+
+            // Step 3: outer embed page -> CFG.playerUrl
+            val outerHtml = app.get(innerUrl, headers = httpHeaders(embedUrl)).text
+            val playerPath = Regex(""""playerUrl"\s*:\s*"([^"]+)"""")
+                .find(outerHtml)?.groupValues?.get(1)?.replace("\\u0026", "&")
+                ?: return@withTimeoutOrNull emptyList()
+            val playerUrl = resolveRelativeUrl(innerUrl, playerPath)
+            val playerOrigin = runCatching { java.net.URI(playerUrl).let { "${it.scheme}://${it.host}" } }
+                .getOrDefault("https://stellarconductornexus.com")
+
+            // Step 4: player page -> CONFIG (api for movies, streamBase for tv) + apiToken
+            val playerHtml = app.get(playerUrl, headers = httpHeaders(innerUrl)).text
+            val cfg = Regex("""CONFIG\s*=\s*(\{.*?\})\s*;""").find(playerHtml)?.groupValues?.get(1)
+                ?: return@withTimeoutOrNull emptyList()
+
+            fun cfgString(key: String): String? =
+                Regex(""""$key"\s*:\s*"([^"]*)""").find(cfg)?.groupValues?.get(1)?.replace("\\u0026", "&")
+
+            val apiToken = cfgString("apiToken") ?: return@withTimeoutOrNull emptyList()
+            val streamBase = cfgString("api") ?: run {
+                val base = cfgString("streamBase") ?: return@withTimeoutOrNull emptyList()
+                if (m.type.equals("movie", ignoreCase = true)) "${base}&stream_urls"
+                else "${base}&season=${m.season ?: 1}&episode=${m.episode ?: 1}&stream_urls"
+            }
+            val metaApi = cfgString("metaApi")
+
+            // Step 5: metadata first (captures pool host), like bootWithMeta does
+            var poolHost: String? = null
+            if (metaApi != null) {
+                runCatching {
+                    val metaJson = app.get(metaApi, headers = httpHeaders(playerUrl)).text
+                    poolHost = Regex(""""stream_urls_api_host"\s*:\s*"([^"]+)"""")
+                        .find(metaJson)?.groupValues?.get(1)
+                }
+            }
+
+            // Step 6: stream_urls request against the pool host (origin swap only)
+            val requestUrl = if (!poolHost.isNullOrBlank()) {
+                runCatching {
+                    val u = java.net.URI(streamBase)
+                    "${u.scheme}://$poolHost${u.rawPath}?${u.rawQuery}"
+                }.getOrDefault(streamBase)
+            } else streamBase
+            val apiHeaders = mapOf(
+                "User-Agent" to UA,
+                "Accept" to "application/json",
+                "Referer" to playerUrl,
+                "Origin" to playerOrigin,
+            )
+            val apiJson = app.get("$requestUrl&api_token=$apiToken", headers = apiHeaders).text
+
+            val apiResponse = runCatching { mapper.readValue(apiJson, VsembedApiResponse::class.java) }
+                .getOrNull()
+                ?: return@withTimeoutOrNull emptyList()
+
+            // stream_urls is a plain array when protection is off, or a single
+            // encrypted base64 string (nonce[12] || ciphertext) when on.
+            val urls: List<String> = when (val raw = apiResponse.data?.streamUrls) {
+                is List<*> -> raw.filterIsInstance<String>().filter { it.startsWith("http") }
+                is String -> {
+                    val wasmUrl = apiResponse.vs?.wasmUrl
+                    val wasmInlineB64 = apiResponse.vs?.wasm
+                    if (wasmUrl.isNullOrBlank() && wasmInlineB64.isNullOrBlank()) emptyList()
+                    else {
+                        val wasmBytes = if (!wasmUrl.isNullOrBlank())
+                            app.get(wasmUrl, headers = mapOf("User-Agent" to UA)).body?.bytes()
+                        else null
+                        val inlineBytes = wasmInlineB64?.let { decodeB64(it) }
+                        val module = wasmBytes ?: inlineBytes
+                        if (module == null) emptyList()
+                        else {
+                            val encBytes = decodeB64(raw)
+                            if (encBytes == null) emptyList()
+                            else runCatching { VsWasm.decrypt(module, encBytes) }.getOrNull()
+                                ?.let { out ->
+                                    String(out, Charsets.UTF_8)
+                                        .split("\n").map { it.trim() }.filter { it.startsWith("http") }
+                                }
+                                ?: emptyList()
+                        }
+                    }
+                }
+                else -> emptyList()
+            }
+            if (urls.isEmpty()) return@withTimeoutOrNull emptyList()
+
+            // Step 8: per-host playlist token (JWT) from the stream host
+            val streamHost = runCatching { java.net.URI(urls.first()).let { "${it.scheme}://${it.host}" } }
+                .getOrDefault(poolHost?.let { "https://$it" } ?: "")
+            val playlistToken = runCatching {
+                val tokText = app.get(
+                    "$streamHost/generate.php?api_token=$apiToken",
+                    headers = mapOf(
+                        "User-Agent" to UA,
+                        "Referer" to playerUrl,
+                        "Origin" to playerOrigin,
+                        "Accept" to "*/*",
+                    ),
+                ).text.trim()
+                if (tokText.startsWith("{")) Regex(""""token"\s*:\s*"([^"]+)"""")
+                    .find(tokText)?.groupValues?.get(1) ?: tokText
+                else tokText
+            }.getOrDefault("")
+
+            val fileName = apiResponse.data?.fileName ?: ""
+            val parsedQ = Regex("""(\d{3,4})p""").find(fileName)?.groupValues?.get(1)?.toIntOrNull() ?: q
+            val labelQ = if (parsedQ in 240..2160) parsedQ else Qualities.Unknown.value
+
+            // The stream hosts sit behind a CDN that rejects browser-less requests:
+            // the playlist (and every segment) needs the player's Referer/Origin.
+            val playHeaders = mapOf(
+                "User-Agent" to UA,
+                "Referer" to playerUrl,
+                "Origin" to playerOrigin,
+            )
+
+            urls.mapIndexedNotNull { idx, url ->
+                // The host rejects the bare playlist ("no token"), so the per-host
+                // token is mandatory; the signed path alone never plays.
+                val finalUrl = when {
+                    url.contains("__TOKEN__") -> url.replace("__TOKEN__", playlistToken)
+                    playlistToken.isBlank() -> url
+                    url.contains('?') -> "$url&token=$playlistToken"
+                    else -> "$url?token=$playlistToken"
+                }
+                if (!verifyUpstreamChain(finalUrl, playHeaders)) return@mapIndexedNotNull null
+                newExtractorLink(
+                    "OneFlex",
+                    "OneFlex - Vsembed ${idx + 1} (${labelQ}p)",
+                    finalUrl,
+                ) {
+                    this.quality = labelQ
+                    this.referer = playerUrl
+                    this.type = ExtractorLinkType.M3U8
+                    this.headers = playHeaders
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    } ?: emptyList()
+
+    /** Classic vidsrc.xyz embed fallback, kept as a second independent source. */
+    private suspend fun resolveVidsrc(m: MediaData, q: Int): List<ExtractorLink> {
+        val embedDomains = listOf(
+            "https://vidsrc.xyz/embed/movie/${m.id}",
+            "https://vidsrc.me/embed/movie/${m.id}",
+            "https://vidsrc.to/embed/movie/${m.id}",
+        )
+        val tvEmbedDomains = listOf(
+            "https://vidsrc.xyz/embed/tv/${m.id}/${m.season}/${m.episode}",
+            "https://vidsrc.me/embed/tv/${m.id}/${m.season}/${m.episode}",
+            "https://vidsrc.to/embed/tv/${m.id}/${m.season}/${m.episode}",
+        )
+        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
+            val s = m.season ?: return emptyList()
+            val e = m.episode ?: return emptyList()
+            tvEmbedDomains
+        }
+        for (url in urls) {
+            val referer = url.substringBefore("/embed")
+            val result = resolveEmbedChain(url, referer + "/", q, "Vidsrc",
+                mapOf("Referer" to referer + "/", "Origin" to referer))
+            if (result != null) return listOf(result)
         }
         return emptyList()
     }
@@ -641,31 +879,6 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         } catch (_: Exception) {
             null
         }
-    }
-
-    private suspend fun resolveVidsrc(m: MediaData, q: Int): List<ExtractorLink> {
-        val embedDomains = listOf(
-            "https://vidsrc.xyz/embed/movie/${m.id}",
-            "https://vidsrc.me/embed/movie/${m.id}",
-            "https://vidsrc.to/embed/movie/${m.id}",
-        )
-        val tvEmbedDomains = listOf(
-            "https://vidsrc.xyz/embed/tv/${m.id}/${m.season}/${m.episode}",
-            "https://vidsrc.me/embed/tv/${m.id}/${m.season}/${m.episode}",
-            "https://vidsrc.to/embed/tv/${m.id}/${m.season}/${m.episode}",
-        )
-        val urls = if (m.type.equals("movie", ignoreCase = true)) embedDomains else {
-            val s = m.season ?: return emptyList()
-            val e = m.episode ?: return emptyList()
-            tvEmbedDomains
-        }
-        for (url in urls) {
-            val referer = url.substringBefore("/embed")
-            val result = resolveEmbedChain(url, referer + "/", q, "Vidsrc",
-                mapOf("Referer" to referer + "/", "Origin" to referer))
-            if (result != null) return listOf(result)
-        }
-        return emptyList()
     }
 
     private suspend fun resolveEmbedSu(m: MediaData, q: Int): List<ExtractorLink> {
@@ -987,8 +1200,11 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         val lines: List<String> = emptyList(),
     )
 
-    private suspend fun playlistCheck(url: String): PlaylistCheck {
-        val res = runCatching { app.get(url, headers = mapOf("User-Agent" to UA)) }.getOrNull()
+    private suspend fun playlistCheck(
+        url: String,
+        headers: Map<String, String> = mapOf("User-Agent" to UA),
+    ): PlaylistCheck {
+        val res = runCatching { app.get(url, headers = headers) }.getOrNull()
             ?: return PlaylistCheck(false, false)
         if (res.code != 200) return PlaylistCheck(false, false)
         val text = res.text.trimStart()
@@ -1004,22 +1220,25 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
      * are literally PNG/JPEG ad slides — those break the player with error
      * 2004, so they must never be exposed.
      */
-    private suspend fun verifyUpstreamChain(upstream: String): Boolean = runCatching {
-        val master = playlistCheck(upstream)
+    private suspend fun verifyUpstreamChain(
+        upstream: String,
+        headers: Map<String, String> = mapOf("User-Agent" to UA),
+    ): Boolean = runCatching {
+        val master = playlistCheck(upstream, headers)
         if (!master.ok) return@runCatching false
 
         var playlistUrl = upstream
         var segments = master.lines
         if (master.isMaster) {
             val variantUrl = resolveRelativeUrl(upstream, master.lines.first())
-            val variant = playlistCheck(variantUrl)
+            val variant = playlistCheck(variantUrl, headers)
             if (!variant.ok) return@runCatching false
             playlistUrl = variantUrl
             segments = variant.lines
         }
 
         val segUrl = resolveRelativeUrl(playlistUrl, segments.first())
-        val seg = app.get(segUrl, headers = mapOf("User-Agent" to UA, "Range" to "bytes=0-2047"))
+        val seg = app.get(segUrl, headers = headers + ("Range" to "bytes=0-2047"))
         if (seg.code != 200 && seg.code != 206) return@runCatching false
         val head = seg.body?.bytes() ?: return@runCatching false
         if (head.isEmpty()) return@runCatching false
@@ -1181,9 +1400,9 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         }
     } ?: emptyList()
 
-    /** Runs every external provider in parallel (hard 20s cap), sorted preferred-quality first. */
+    /** Runs every external provider in parallel (hard 60s cap), sorted preferred-quality first. */
     private suspend fun resolveExternalFallback(media: MediaData, preferredQ: Int): List<ExtractorLink> {
-        val raw = withTimeoutOrNull(20_000L) {
+        val raw = withTimeoutOrNull(60_000L) {
             externalProviders.amap { provider ->
                 runCatching {
                     provider.servers.flatMap { server -> provider.resolver(media, server, preferredQ) }
@@ -1287,6 +1506,40 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                                 this.headers = vidyHeaders()
                             }
                         )
+                    }
+                    // v7 feature: the API can answer with a master playlist only.
+                    // Enumerate its variants into one link per quality; if that
+                    // fails, expose the master playlist itself.
+                    val master = payload.playlist
+                    if (!master.isNullOrBlank()) {
+                        val variants = runCatching {
+                            M3u8Helper.generateM3u8(
+                                source = "$name - $cityLabel",
+                                streamUrl = master,
+                                referer = referer,
+                            )
+                        }.getOrNull()
+                        if (!variants.isNullOrEmpty()) {
+                            for (v in variants) {
+                                links.add(
+                                    newExtractorLink(name, "$name - $cityLabel ${v.quality}p", v.url) {
+                                        this.quality = v.quality
+                                        this.referer = referer
+                                        this.type = ExtractorLinkType.M3U8
+                                        this.headers = vidyHeaders()
+                                    }
+                                )
+                            }
+                        } else {
+                            links.add(
+                                newExtractorLink(name, "$name - $cityLabel (Auto)", master) {
+                                    this.quality = Qualities.Unknown.value
+                                    this.referer = referer
+                                    this.type = ExtractorLinkType.M3U8
+                                    this.headers = vidyHeaders()
+                                }
+                            )
+                        }
                     }
                 } else {
                     // Alt cities: one direct link, preferred quality first.

@@ -69,6 +69,7 @@ subprojects {
         val cloudstream by configurations
         val compileOnly by configurations
         val implementation by configurations
+        val testImplementation by configurations
 
         // OFFICIAL: compile-time stubs for all CloudStream classes (the app provides them at runtime).
         // The old com.github.recloudstream.cloudstream:library:-SNAPSHOT artifact no longer contains
@@ -84,6 +85,8 @@ subprojects {
         implementation("org.jsoup:jsoup:1.18.3")
         implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
         implementation("com.github.teamnewpipe:NewPipeExtractor:v0.25.2")
+
+        testImplementation("junit:junit:4.13.2")
     }
 }
 
