@@ -4,6 +4,10 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.LruCache
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.core.type.TypeReference
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.extractors.ByseSX
@@ -12,6 +16,10 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -57,6 +65,103 @@ private fun cachePut(k: String, links: List<ExtractorLink>) {
 
 /** Fire-and-forget scope so subtitle work never delays video start. */
 private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+/**
+ * Per-site server templates, cached per process (site + media type).
+ * Filled from each site's own source catalog or its JS bundle.
+ */
+private val siteTemplateCache = object : LruCache<String, List<SiteTemplate>>(64) {}
+
+/** Hosts running the same player chain as vsembed.ru (vs_src.php + wasm decrypt). */
+private val vidsrcFamilyHosts = setOf(
+    "vsembed.ru", "vidsrc.me", "vidsrc.sh", "vidsrc.to", "vidsrc.in", "vidsrc.link",
+    "vidsrc.net", "vidsrc.cc", "vidsrc.pro", "vidsrc.party", "vidsrc.life", "vidsrc.lol",
+    "vidsrc.pm", "vidsrc.rip", "vidsrc.ch", "vidsrc.ws", "vidsrc.bz", "vidsrc.one",
+    "vidsrc.live", "vidsrc.tv", "vidsrc.mov", "vidsrc.top", "vidsrc.click",
+    "vidsrc-embed.ru", "vixsrc.to",
+)
+
+/**
+ * One server template of a site.
+ *  - [url] is either a full template (".../movie/{id}") or, when [isPrefix],
+ *    a base the site appends the id to (".../movie/").
+ *  - [isTv] marks the templates that belong to series instead of movies.
+ *  - [idType], [urlFormat] and [extraParams] carry the server descriptor
+ *    format used by the Next.js sites ("id/season/episode" + query flags).
+ */
+private data class SiteTemplate(
+    val label: String,
+    val url: String,
+    val isPrefix: Boolean = false,
+    val isTv: Boolean = false,
+    val idType: String? = null,
+    val urlFormat: String? = null,
+    val extraParams: String? = null,
+)
+
+/** One entry of a site's own server list (api.viduki.net/embed_providers). */
+private data class SiteProvider(
+    @JsonProperty("id") val id: String? = null,
+    @JsonProperty("label") val label: String? = null,
+    @JsonProperty("movie") val movie: String? = null,
+    @JsonProperty("tv") val tv: String? = null,
+)
+
+/** Response of the shared server-list endpoint. */
+private data class SiteProviderList(
+    @JsonProperty("site") val site: String? = null,
+    @JsonProperty("providers") val providers: List<SiteProvider> = emptyList(),
+)
+
+/** One server of the vidrock multi-server API. */
+private data class VidrockServer(
+    @JsonProperty("url") val url: String? = null,
+    @JsonProperty("language") val language: String? = null,
+    @JsonProperty("type") val type: String? = null,
+)
+
+/** Decodes base64 that may be URL-safe, un-padded or contain whitespace. */
+private fun decodeBase64Flexible(value: String): ByteArray? = runCatching {
+    val clean = value.trim()
+        .filter { !it.isWhitespace() }
+        .replace('-', '+')
+        .replace('_', '/')
+    val pad = (4 - clean.length % 4) % 4
+    android.util.Base64.decode(clean + "=".repeat(pad), android.util.Base64.DEFAULT)
+}.getOrNull()
+
+/**
+ * Decryption used by the vidrock player stack (AES-256-GCM, key baked into
+ * the site bundle). Payload layout: base64url(iv[12] || ciphertext || tag[16]).
+ */
+private object VidrockCipher {
+    private const val KEY_HEX =
+        "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f"
+
+    private fun hexBytes(hex: String): ByteArray {
+        val out = ByteArray(hex.length / 2)
+        for (i in out.indices) {
+            out[i] = ((hex[i * 2].digitToInt(16) shl 4) or hex[i * 2 + 1].digitToInt(16)).toByte()
+        }
+        return out
+    }
+
+    fun decrypt(encrypted: String): String? {
+        val raw = decodeBase64Flexible(encrypted) ?: return null
+        if (raw.size < 28) return null
+        val iv = raw.copyOfRange(0, 12)
+        val body = raw.copyOfRange(12, raw.size)
+        return runCatching {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(hexBytes(KEY_HEX), "AES"),
+                GCMParameterSpec(128, iv),
+            )
+            String(cipher.doFinal(body), Charsets.UTF_8)
+        }.getOrNull()
+    }
+}
 
 /**
  * One provider instance per 1flex-family site (fubuki's multi-server stack:
@@ -580,21 +685,26 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
      *  8. <stream host>/generate.php?api_token= -> playlist JWT (?token= covers
      *     the whole playlist chain; variant/segment URLs come back pre-stamped)
      */
-    private suspend fun resolveVsembed(m: MediaData, q: Int): List<ExtractorLink> = withTimeoutOrNull(25_000L) {
+    private suspend fun resolveVsembed(
+        m: MediaData,
+        q: Int,
+        base: String = "https://vsembed.ru",
+        label: String = "Vsembed",
+    ): List<ExtractorLink> = withTimeoutOrNull(25_000L) {
         try {
             val embedUrl = if (m.type.equals("movie", ignoreCase = true))
-                "https://vsembed.ru/embed/movie/${m.id}"
+                "$base/embed/movie/${m.id}"
             else {
                 val s = m.season ?: return@withTimeoutOrNull emptyList()
                 val e = m.episode ?: return@withTimeoutOrNull emptyList()
-                "https://vsembed.ru/embed/tv/${m.id}/$s/$e"
+                "$base/embed/tv/${m.id}/$s/$e"
             }
 
-            // Step 1: embed page -> data-api attr (HTML-escaped &amp;)
+            // Step 1: embed page -> data-api attr (HTML-escaped &)
             val embedHeaders = mapOf(
                 "User-Agent" to UA,
                 "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
-                "Referer" to "https://vsembed.ru/",
+                "Referer" to "$base/",
             )
             val embedRes = app.get(embedUrl, headers = embedHeaders)
             logDiag("vsembed embed page ${embedRes.code} $embedUrl")
@@ -602,7 +712,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             val dataApi = Regex("""data-api=["']([^"']+)["']""")
                 .find(embedHtml)?.groupValues?.get(1)?.replace("&" + "amp;", "&")
                 ?: return@withTimeoutOrNull emptyList()
-            val vsSrcUrl = if (dataApi.startsWith("http")) dataApi else "https://vsembed.ru$dataApi"
+            val vsSrcUrl = if (dataApi.startsWith("http")) dataApi else "$base$dataApi"
 
             // Step 2: vs_src.php -> {"src": "..."} with exact embed referer
             val srcRes = app.get(vsSrcUrl, headers = httpHeaders(embedUrl))
@@ -778,7 +888,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                 if (!verified) logDiag("vsembed link $idx not verified: $finalUrl")
                 newExtractorLink(
                     "OneFlex",
-                    "OneFlex - Vsembed ${idx + 1} (${labelQ}p)",
+                    "OneFlex - $label ${idx + 1} (${labelQ}p)",
                     finalUrl,
                 ) {
                     this.quality = labelQ
@@ -1022,14 +1132,486 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     }
 
     // --------------------------------------------------------
-    //  Direct site scrape — fetches THIS provider's own watch
-    //  page and extracts streams straight from its HTML/JS.
-    //  Works per-site (all 34 family sites), independent of
-    //  the shared vidy player API.
+    //  Per-site servers — THIS provider's own server list,
+    //  fetched from the site itself: either the JSON source
+    //  catalog it publishes or the templates it hardcodes in
+    //  its own JS bundle. Every family site keeps its own
+    //  list, so each provider serves its own servers first.
     // --------------------------------------------------------
 
+    private data class SiteSourceEntry(
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("movieUrl") val movieUrl: String? = null,
+        @JsonProperty("tvUrl") val tvUrl: String? = null,
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("id") val id: String? = null,
+    )
 
+    private data class SiteSourcesResponse(
+        @JsonProperty("sources") val sources: List<SiteSourceEntry>? = null,
+    )
 
+    private fun siteHeaders(): Map<String, String> = mapOf(
+        "User-Agent" to UA,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.9",
+        "Referer" to "$mainUrl/",
+        "Origin" to mainUrl.trimEnd('/'),
+    )
+
+    private fun hostOf(url: String): String =
+        runCatching { java.net.URI(url).host?.lowercase() }.getOrNull().orEmpty()
+
+    private fun watchPageUrl(media: MediaData): String =
+        if (media.type.equals("movie", ignoreCase = true)) "$mainUrl/watch/movie/${media.id}"
+        else "$mainUrl/watch/tv/${media.id}/${media.season ?: 1}/${media.episode ?: 1}"
+
+    /** Site keys the shared server-list endpoint may know this site under. */
+    private fun siteKeyCandidates(): List<String> {
+        val out = LinkedHashSet<String>()
+        val brand = name.substringBefore(" (").lowercase().replace(Regex("[^a-z0-9]+"), "")
+        if (brand.isNotBlank()) out.add(brand)
+        val host = hostOf(mainUrl)
+        if (host.isNotBlank()) {
+            host.split(".").filter { it != "www" && it.length > 2 }.forEach { out.add(it) }
+        }
+        return out.toList()
+    }
+
+    /**
+     * The sites of this family keep their own server list on the shared
+     * endpoint api.viduki.net/embed_providers?site=<key>. The endpoint only
+     * answers for the site origin that owns the key, so the request carries
+     * that origin and a small set of key candidates is tried.
+     */
+    private suspend fun fetchSiteProviders(): List<SiteProvider> {
+        val origin = mainUrl.trimEnd('/')
+        for (key in siteKeyCandidates()) {
+            val res = runCatching {
+                app.get(
+                    "https://api.viduki.net/embed_providers?site=$key",
+                    headers = mapOf(
+                        "User-Agent" to UA,
+                        "Accept" to "application/json",
+                        "Referer" to "$origin/",
+                        "Origin" to origin,
+                    ),
+                )
+            }.getOrNull() ?: continue
+            if (res.code != 200) continue
+            val parsed = runCatching {
+                mapper.readValue(res.text, SiteProviderList::class.java)
+            }.getOrNull() ?: continue
+            if (parsed.providers.isEmpty()) continue
+            return parsed.providers
+        }
+        return emptyList()
+    }
+
+    /**
+     * Server group of the vidrock stack: every site that embeds vidrock uses
+     * this API, which returns the server names with AES-GCM encrypted
+     * playlist urls.
+     */
+    private suspend fun resolveVidrockServers(
+        media: MediaData,
+        onLink: (ExtractorLink) -> Unit,
+    ): List<ExtractorLink> {
+        val isMovie = media.type.equals("movie", ignoreCase = true)
+        val apiUrl = if (isMovie) "https://vidrock.net/api/movie/${media.id}"
+        else "https://vidrock.net/api/tv/${media.id}/${media.season ?: 1}/${media.episode ?: 1}"
+        val res = runCatching {
+            app.get(
+                apiUrl,
+                headers = mapOf(
+                    "User-Agent" to UA,
+                    "Accept" to "application/json",
+                    "Referer" to "https://vidrock.to/",
+                ),
+            )
+        }.getOrNull() ?: return emptyList()
+        if (res.code != 200) return emptyList()
+        val servers = runCatching {
+            mapper.readValue(res.text, object : TypeReference<Map<String, VidrockServer>>() {})
+        }.getOrNull() ?: return emptyList()
+
+        val out = mutableListOf<ExtractorLink>()
+        for ((serverName, server) in servers) {
+            val encrypted = server.url ?: continue
+            if (encrypted.isBlank()) continue
+            val playlist = VidrockCipher.decrypt(encrypted) ?: continue
+            if (!playlist.startsWith("http")) continue
+            val headers = mapOf(
+                "User-Agent" to UA,
+                "Referer" to "https://vidrock.to/",
+                "Origin" to "https://vidrock.to",
+            )
+            if (!verifyUpstreamChain(playlist, headers)) {
+                logDiag("vidrock server $serverName not reachable")
+                continue
+            }
+            val label = serverName
+            val link = newExtractorLink(name, "$name - Vidrock $label", playlist) {
+                this.quality = Qualities.Unknown.value
+                this.referer = "https://vidrock.to/"
+                this.type = ExtractorLinkType.M3U8
+                this.headers = headers
+            }
+            out.add(link)
+            onLink.invoke(link)
+        }
+        logDiag("vidrock servers ${out.size}/${servers.size} from $apiUrl")
+        return out
+    }
+
+    /** Pulls the site's own server templates. */
+    private suspend fun discoverSiteTemplates(media: MediaData): List<SiteTemplate> {
+        val cacheKey = "$mainUrl:${media.type}"
+        siteTemplateCache.get(cacheKey)?.let { return it }
+
+        val found = LinkedHashMap<String, SiteTemplate>()
+        val isMovie = media.type.equals("movie", ignoreCase = true)
+
+        // 0. sites that publish their server list as a JSON catalog keyed by site
+        runCatching {
+            val providers = fetchSiteProviders()
+            if (providers.isNotEmpty()) {
+                for (provider in providers) {
+                    val raw = if (isMovie) provider.movie else provider.tv
+                    if (raw.isNullOrBlank()) continue
+                    val template = SiteTemplate(
+                        label = provider.label ?: provider.id ?: hostOf(raw),
+                        url = raw,
+                        isTv = !isMovie,
+                    )
+                    if (!found.containsKey(raw)) found[raw] = template
+                }
+                logDiag("site providers ${found.size} servers from api.viduki.net")
+            }
+        }.onFailure { logDiag("site providers failed: ${it.message}") }
+
+        // 1. sites that publish their server catalog as JSON
+        if (found.isEmpty()) {
+            runCatching {
+                val res = app.get("$mainUrl/api/sources/cached", headers = siteHeaders())
+                if (res.code == 200 && res.text.trimStart().startsWith("{")) {
+                    val parsed = mapper.readValue(res.text, SiteSourcesResponse::class.java)
+                    for (src in parsed.sources ?: emptyList()) {
+                        val tpl = if (isMovie) (src.movieUrl ?: src.url) else (src.tvUrl ?: src.url)
+                        if (tpl.isNullOrBlank()) continue
+                        val template = SiteTemplate(
+                            label = src.name ?: src.id ?: hostOf(tpl),
+                            url = tpl,
+                            isTv = tpl.contains("/tv/") || tpl.contains("{season}"),
+                        )
+                        if (!found.containsKey(tpl)) found[tpl] = template
+                    }
+                    logDiag("site catalog ${found.size} sources from $mainUrl")
+                }
+            }.onFailure { logDiag("site catalog api failed: ${it.message}") }
+        }
+
+        // 2. sites that hardcode their server templates in their JS bundle
+        if (found.isEmpty()) {
+            runCatching {
+                val page = app.get(watchPageUrl(media), headers = siteHeaders())
+                if (page.code != 200) {
+                    logDiag("site watch page ${page.code} $mainUrl")
+                    return@runCatching
+                }
+                val scripts = Regex("""<script[^>]+src=["']([^"']+)["']""")
+                    .findAll(page.text).map { it.groupValues[1] }.distinct().take(20).toList()
+                for (src in scripts) {
+                    val url = if (src.startsWith("http")) src
+                    else "${mainUrl.trimEnd('/')}/${src.trimStart('/')}"
+                    val js = runCatching { app.get(url, headers = siteHeaders()) }.getOrNull() ?: continue
+                    if (js.code != 200) continue
+                    val descriptors = extractServerDescriptors(js.text)
+                    for (template in descriptors) {
+                        val key = "${template.label}|${template.url}"
+                        if (!found.containsKey(key)) found[key] = template
+                    }
+                    val descriptorUrls = descriptors.map { it.url }.toSet()
+                    for (template in extractSiteTemplates(js.text)) {
+                        if (descriptorUrls.contains(template.url)) continue
+                        if (!found.containsKey(template.url)) found[template.url] = template
+                    }
+                    if (found.size >= 8) break
+                }
+                logDiag("site bundle scan ${found.size} templates from $mainUrl")
+            }.onFailure { logDiag("site bundle scan failed: ${it.message}") }
+        }
+
+        val list = found.values.toList()
+        if (list.isNotEmpty()) siteTemplateCache.put(cacheKey, list)
+        return list
+    }
+
+    /** Template urls found inside a site's JS bundle. */
+    private fun extractSiteTemplates(js: String): List<SiteTemplate> {
+        val out = LinkedHashMap<String, SiteTemplate>()
+
+        for (m in Regex("""["'](https?://[^"'\s]{4,200}\{id\}[^"'\s]{0,200})["']""").findAll(js)) {
+            val tpl = m.groupValues[1]
+            if (!out.containsKey(tpl)) {
+                out[tpl] = SiteTemplate(
+                    label = hostOf(tpl),
+                    url = tpl,
+                    isTv = tpl.contains("/tv/") || tpl.contains("{season}"),
+                )
+            }
+        }
+
+        for (m in Regex("""["'`](https?://[^"'`\s]{4,180}/(?:movie|tv)/)["'`]\s*\.concat\(""").findAll(js)) {
+            val base = m.groupValues[1]
+            if (!out.containsKey(base)) {
+                out[base] = SiteTemplate(
+                    label = hostOf(base),
+                    url = base,
+                    isPrefix = true,
+                    isTv = base.contains("/tv/"),
+                )
+            }
+        }
+
+        return out.values.toList()
+    }
+
+    /**
+     * Server descriptors of the Next.js sites: the bundle keeps the player's
+     * server list as {name, url, idType, urlFormat, extraParams} objects, the
+     * same list the site's own server dropdown shows.
+     */
+    private fun extractServerDescriptors(js: String): List<SiteTemplate> {
+        val out = LinkedHashMap<String, SiteTemplate>()
+        val pattern = Regex(
+            """\{\s*name\s*:\s*"([^"]+)"\s*,\s*url\s*:\s*"([^"]+)"(?:[^}]*?idType\s*:\s*"([^"]*)")?(?:[^}]*?urlFormat\s*:\s*"([^"]*)")?(?:[^}]*?extraParams\s*:\s*"([^"]*)")?"""
+        )
+        for (m in pattern.findAll(js)) {
+            val label = m.groupValues[1]
+            val url = m.groupValues[2]
+            val idType = m.groupValues[3].ifBlank { null }
+            val urlFormat = m.groupValues[4].ifBlank { null }
+            val extraParams = m.groupValues[5].ifBlank { null }
+            if (urlFormat == null) continue
+            val key = "$label|$url"
+            if (out.containsKey(key)) continue
+            out[key] = SiteTemplate(
+                label = label,
+                url = url,
+                isTv = url.contains("/tv/") || urlFormat.contains("season"),
+                idType = idType,
+                urlFormat = urlFormat,
+                extraParams = extraParams,
+            )
+        }
+        return out.values.toList()
+    }
+
+    private fun buildTemplateUrl(template: SiteTemplate, media: MediaData): String {
+        val id = media.id.toString()
+        val season = (media.season ?: 1).toString()
+        val episode = (media.episode ?: 1).toString()
+
+        if (template.urlFormat != null) {
+            val idPart = if (template.idType == "imdb") (media.imdb ?: id) else id
+
+            fun fillPath(text: String): String = text
+                .replace("{id}", idPart)
+                .replace("{season}", season)
+                .replace("{episode}", episode)
+                .replace(Regex("(?<![A-Za-z0-9_])id(?![A-Za-z0-9_])"), idPart)
+                .replace(Regex("(?<![A-Za-z0-9_])season(?![A-Za-z0-9_])"), season)
+                .replace(Regex("(?<![A-Za-z0-9_])episode(?![A-Za-z0-9_])"), episode)
+
+            fun fillQuery(text: String): String = text
+                .replace("{id}", idPart)
+                .replace("{season}", season)
+                .replace("{episode}", episode)
+
+            fun splitQuery(text: String): Pair<String, String?> {
+                val at = text.indexOf('?')
+                return if (at >= 0) text.substring(0, at) to text.substring(at + 1) else text to null
+            }
+
+            val (basePathRaw, baseQueryRaw) = splitQuery(template.url)
+            val (formatPathRaw, formatQueryRaw) = splitQuery(template.urlFormat)
+            var formatPath = formatPathRaw
+            val formatFlags = mutableListOf<String>()
+            val amp = formatPath.indexOf('&')
+            if (amp >= 0) {
+                formatFlags += formatPath.substring(amp + 1)
+                formatPath = formatPath.substring(0, amp)
+            }
+
+            val baseHasPlaceholder = basePathRaw.contains("{id}") ||
+                basePathRaw.contains("{season}") ||
+                (baseQueryRaw?.contains("{id}") == true)
+            val path = if (baseHasPlaceholder) {
+                // the base already carries the placeholder, only the remaining
+                // path segments of the format are appended
+                val extra = formatPath.split("/").filter { it.isNotBlank() && it != "id" }
+                val filled = fillPath(basePathRaw)
+                if (extra.isEmpty()) filled
+                else "${filled.trimEnd('/')}/${fillPath(extra.joinToString("/"))}"
+            } else {
+                "${fillPath(basePathRaw).trimEnd('/')}/${fillPath(formatPath).trimStart('/')}"
+            }
+
+            val queryParts = mutableListOf<String>()
+            baseQueryRaw?.let { queryParts += fillQuery(it) }
+            formatQueryRaw?.let { queryParts += fillQuery(it) }
+            formatFlags.forEach { queryParts += fillQuery(it) }
+            template.extraParams?.let { extra ->
+                val body = extra.removePrefix("?")
+                if (body.isNotBlank()) queryParts += fillQuery(body)
+            }
+            var url = path
+            val usable = queryParts.filter { it.isNotBlank() }
+            if (usable.isNotEmpty()) url += "?" + usable.joinToString("&")
+            return url
+        }
+
+        var url = if (template.isPrefix) {
+            if (template.isTv) "${template.url}$id/$season/$episode" else "${template.url}$id"
+        } else {
+            template.url
+                .replace("{id}", id)
+                .replace("{s}", season)
+                .replace("{e}", episode)
+                .replace("{season}", season)
+                .replace("{episode}", episode)
+        }
+        url = Regex("""\{[a-zA-Z_][a-zA-Z0-9_]*\}""").replace(url, "")
+        url = url.replace("%23", "")
+        url = url.replace("?&", "?").replace("&&", "&")
+        if (url.endsWith("?") || url.endsWith("&")) url = url.dropLast(1)
+        return url
+    }
+
+    /** First playlist url inside a player page (raw or JSON encoded). */
+    private fun extractStreamUrl(text: String): String? {
+        val normalized = text.replace("\\/", "/").replace("\\u002F", "/").replace("\\u0026", "&")
+        return Regex("""(?:https?:)?//[^"'\\\s<>]+?\.m3u8[^"'\\\s<>]*""")
+            .findAll(normalized)
+            .map { m ->
+                var v = m.value.trimEnd(')', ',', ';', '\\')
+                if (v.startsWith("//")) v = "https:$v"
+                v
+            }
+            .firstOrNull()
+    }
+
+    /** Resolves the site's own servers into verified playback links. */
+    private suspend fun resolveSiteServers(
+        media: MediaData,
+        preferredQ: Int,
+        onLink: (ExtractorLink) -> Unit = {},
+    ): List<ExtractorLink> {
+        val resolved = mutableListOf<ExtractorLink>()
+
+        // Server group the sites embed through vidrock: every entry is a
+        // playlist of the site's own player stack.
+        resolved.addAll(
+            withTimeoutOrNull(20_000L) { resolveVidrockServers(media, onLink) }.orEmpty()
+        )
+
+        val templates = withTimeoutOrNull(12_000L) { discoverSiteTemplates(media) } ?: emptyList()
+        if (templates.isEmpty()) {
+            logDiag("site servers resolved ${resolved.size} from $mainUrl")
+            return resolved
+        }
+        val isMovie = media.type.equals("movie", ignoreCase = true)
+        val preferred = templates.filter { !it.isTv }
+        val ordered = if (isMovie) preferred + templates.filter { it.isTv }
+        else templates.filter { it.isTv } + preferred
+        // vidrock servers are already resolved as their own group, vidy is
+        // covered by the dedicated vidy tier
+        val picked = ordered.filter {
+            val host = hostOf(it.url)
+            !host.contains("vidrock") && !host.contains("vidy")
+        }.take(12)
+        val extra = coroutineScope {
+            picked.map { template ->
+                async {
+                    resolveSiteTemplate(template, media, preferredQ).also { found ->
+                        found.forEach { onLink.invoke(it) }
+                    }
+                }
+            }.awaitAll()
+        }.flatten()
+        resolved.addAll(extra)
+        logDiag("site servers resolved ${resolved.size}/${picked.size + 1} from $mainUrl")
+        return resolved
+    }
+
+    private suspend fun resolveSiteTemplate(
+        template: SiteTemplate,
+        media: MediaData,
+        preferredQ: Int,
+    ): List<ExtractorLink> = withTimeoutOrNull(15_000L) {
+        try {
+            val label = template.label
+            val host = hostOf(template.url)
+            if (host in vidsrcFamilyHosts) {
+                val chain = resolveVsembed(media, preferredQ, "https://$host", label)
+                if (chain.isNotEmpty()) return@withTimeoutOrNull chain
+            }
+
+            val url = buildTemplateUrl(template, media)
+            val page = runCatching { app.get(url, headers = siteHeaders()) }.getOrNull()
+                ?: return@withTimeoutOrNull emptyList()
+            if (page.code != 200) return@withTimeoutOrNull emptyList()
+
+            var streamUrl = extractStreamUrl(page.text)
+            var streamReferer = url
+            if (streamUrl == null) {
+                val iframe = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
+                    .find(page.text)?.groupValues?.get(1)
+                if (!iframe.isNullOrBlank()) {
+                    val iframeUrl = if (iframe.startsWith("http")) iframe
+                    else "${mainUrl.trimEnd('/')}/${iframe.trimStart('/')}"
+                    val inner = runCatching {
+                        app.get(iframeUrl, headers = siteHeaders() + ("Referer" to url))
+                    }.getOrNull()
+                    if (inner != null && inner.code == 200) {
+                        streamUrl = extractStreamUrl(inner.text)
+                        streamReferer = iframeUrl
+                    }
+                }
+            }
+            val target = streamUrl ?: return@withTimeoutOrNull emptyList()
+
+            val refererHost = hostOf(streamReferer)
+            val headerSets = buildList {
+                add(mapOf("User-Agent" to UA, "Referer" to streamReferer))
+                if (refererHost.isNotBlank()) {
+                    add(mapOf("User-Agent" to UA, "Referer" to streamReferer, "Origin" to "https://$refererHost"))
+                }
+                add(mapOf("User-Agent" to UA))
+            }
+            var working: Map<String, String>? = null
+            for (headers in headerSets) {
+                if (verifyUpstreamChain(target, headers)) {
+                    working = headers
+                    break
+                }
+            }
+            val emitHeaders = working ?: return@withTimeoutOrNull emptyList()
+            logDiag("site source $label -> $target")
+
+            listOf(
+                newExtractorLink(name, "$name - $label", target) {
+                    this.quality = Qualities.Unknown.value
+                    this.referer = streamReferer
+                    this.type = ExtractorLinkType.M3U8
+                    this.headers = emitHeaders
+                }
+            )
+        } catch (_: Exception) {
+            emptyList()
+        }
+    } ?: emptyList()
 
     private suspend fun resolveExternalFallback(media: MediaData, preferredQ: Int): List<ExtractorLink> {
         val raw = withTimeoutOrNull(60_000L) {
@@ -1112,6 +1694,21 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         val subtitles = linkedMapOf<String, SubtitleFile>()
         val links = mutableListOf<ExtractorLink>()
         var added = 0
+
+        // This site's own servers run beside vidy and stream their links out as
+        // soon as each server resolves, so they never delay the other links.
+        val siteScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val siteEmitted = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
+        val siteJob = siteScope.async {
+            runCatching {
+                resolveSiteServers(media, preferredQ) { link ->
+                    runCatching {
+                        siteEmitted.add(link)
+                        callback.invoke(link)
+                    }
+                }
+            }.getOrDefault(emptyList())
+        }
 
         if (seed != null) withTimeoutOrNull(20_000L) {
             vidyBlockedHit = false
@@ -1196,6 +1793,22 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             }
         }
 
+        // ---- Tier 0: this site's own servers (site catalog / bundle) ----
+        // Their links were already handed to the callback as they resolved, so
+        // they are only collected here when nothing else was found.
+        val siteLinks = try {
+            if (links.isEmpty()) {
+                withTimeoutOrNull(20_000L) { siteJob.await() }.orEmpty()
+            } else {
+                emptyList()
+            }
+        } finally {
+            if (links.isEmpty()) runCatching { siteScope.cancel() }
+        }
+        if (siteLinks.isNotEmpty()) {
+            logDiag("loadLinks tier0 site servers -> ${siteLinks.size}")
+        }
+
         // ---- Tier 2: external backup resolvers when vidy fails ----
         if (links.isEmpty()) {
             links.addAll(resolveExternalFallback(media, preferredQ))
@@ -1220,7 +1833,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             cachePut(cacheKey, links)
         }
 
-        return links.isNotEmpty()
+        return links.isNotEmpty() || siteEmitted.isNotEmpty()
     }
 }
 
