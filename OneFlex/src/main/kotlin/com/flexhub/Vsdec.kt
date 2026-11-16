@@ -93,6 +93,9 @@ package com.flexhub
         private val brTables = ArrayList<IntArray>()
         private var memPagesInit = 0
 
+        /** Instruction counter shared by every (nested) call, so the budget covers the whole run. */
+        private var steps = 0L
+
         init {
             val r = Reader(wasmBytes, 0)
             val magic = r.bytes(4)
@@ -335,7 +338,6 @@ package com.flexhub
                 fEntry[0] = 0; fEnd[0] = nIns; fStart[0] = 0; fIsLoop[0] = false; fArity[0] = f.nResults
 
                 var ip = 0
-                var steps = 0L
                 while (ip < nIns) {
                     if (++steps > MAX_INSTRUCTIONS) {
                         throw IllegalStateException("wasm instruction budget exceeded")
