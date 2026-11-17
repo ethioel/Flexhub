@@ -18,8 +18,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -641,10 +641,39 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     )
 
     private val externalProviders: List<ExternalProvider> = listOf(
-        ExternalProvider("Vsembed", listOf("default")) { m, _, q -> resolveVsembed(m, q) },
+        ExternalProvider("Vsembed", listOf("default")) { m, _, q -> resolveVsembedAny(m, q) },
         ExternalProvider("OneFlex", listOf("self")) { m, _, q -> resolveRivestreamEmbed(m, q) },
         ExternalProvider("OneFlex", listOf("prime")) { m, _, q -> resolveRivestreamProvider(m, q) },
     )
+
+    /** Mirror hosts of the vidsrc family; one blocked host must not kill the tier. */
+    private val vidsrcHosts = listOf(
+        "https://vsembed.ru",
+        "https://vidsrc.me",
+        "https://vidsrc.sh",
+    )
+
+    /** Retries flaky upstreams: several of them fail intermittently. */
+    private suspend fun <T> retrying(
+        attempts: Int = 3,
+        delayMs: Long = 700,
+        block: suspend () -> T?,
+    ): T? {
+        for (attempt in 0 until attempts) {
+            val result = runCatching { block() }.getOrNull()
+            if (result != null) return result
+            if (attempt < attempts - 1) delay(delayMs * (attempt + 1))
+        }
+        return null
+    }
+
+    /** Tries every mirror host in parallel, the first one that answers wins. */
+    private suspend fun resolveVsembedAny(m: MediaData, q: Int): List<ExtractorLink> = coroutineScope {
+        vidsrcHosts.map { base ->
+            async { runCatching { resolveVsembed(m, q, base, "Vsembed") }.getOrDefault(emptyList()) }
+        }.awaitAll().firstOrNull { it.isNotEmpty() } ?: emptyList()
+    }
+
 
 
     private data class VsembedApiData(
@@ -706,7 +735,10 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                 "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
                 "Referer" to "$base/",
             )
-            val embedRes = app.get(embedUrl, headers = embedHeaders)
+            val embedRes = retrying(attempts = 3, delayMs = 800) {
+                val res = runCatching { app.get(embedUrl, headers = embedHeaders) }.getOrNull()
+                if (res == null || res.code != 200) null else res
+            } ?: return@withTimeoutOrNull emptyList()
             logDiag("vsembed embed page ${embedRes.code} $embedUrl")
             val embedHtml = embedRes.text
             val dataApi = Regex("""data-api=["']([^"']+)["']""")
@@ -715,12 +747,19 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             val vsSrcUrl = if (dataApi.startsWith("http")) dataApi else "$base$dataApi"
 
             // Step 2: vs_src.php -> {"src": "..."} with exact embed referer
-            val srcRes = app.get(vsSrcUrl, headers = httpHeaders(embedUrl))
-            logDiag("vsembed vs_src ${srcRes.code} $vsSrcUrl")
-            val srcJson = srcRes.text
+            // The endpoint rate limits and answers 403 every other request.
+            val srcJson = retrying(attempts = 4, delayMs = 900) {
+                val res = runCatching { app.get(vsSrcUrl, headers = httpHeaders(embedUrl)) }.getOrNull()
+                if (res == null) null else {
+                    logDiag("vsembed vs_src ${res.code} $vsSrcUrl")
+                    val body = res.text
+                    Regex(""""src"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1)?.let { body }
+                }
+            } ?: return@withTimeoutOrNull emptyList()
             val innerUrl = Regex(""""src"\s*:\s*"([^"]+)"""")
                 .find(srcJson)?.groupValues?.get(1)
                 ?: return@withTimeoutOrNull emptyList()
+
 
             // Step 3: outer embed page -> CFG.playerUrl
             val outerRes = app.get(innerUrl, headers = httpHeaders(embedUrl))
@@ -978,7 +1017,11 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         }
         return withTimeoutOrNull(15_000L) {
             try {
-                val json = app.get(url, headers = httpHeaders("https://www.rivestream.app/")).text
+                val json = retrying(attempts = 3, delayMs = 900) {
+                    val body = app.get(url, headers = rivestreamHeaders()).text
+                    val parsed = runCatching { mapper.readValue(body, RivestreamEmbedResponse::class.java) }.getOrNull()
+                    parsed?.data?.sources?.takeIf { it.isNotEmpty() }?.let { body }
+                } ?: return@withTimeoutOrNull emptyList()
                 val response = mapper.readValue(json, RivestreamEmbedResponse::class.java)
                 val sources = response.data?.sources ?: return@withTimeoutOrNull emptyList()
 
@@ -1006,7 +1049,7 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                 perSource.flatten().map { (el, meta) ->
                     val (serverName, parsedQ) = meta
                     val qLabel = if (parsedQ > 0) "(${parsedQ}p)" else "(auto)"
-                    newExtractorLink("OneFlex", "OneFlex - $serverName $qLabel", el.url) {
+                    newExtractorLink(name, "$name - $serverName $qLabel", el.url) {
                         this.quality = if (parsedQ in 1..2160) parsedQ else Qualities.Unknown.value
                         this.referer = el.referer
                         this.type = el.type
@@ -1033,10 +1076,35 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         png || gif || jpg || riff
     }
 
+    /**
+     * Media segment signatures. Payloads that match none of them (custom
+     * encrypted blobs the player cannot decrypt, HTML error pages, ad slides)
+     * are not playable and must never be exposed as a server.
+     */
+    private fun looksLikeMedia(head: ByteArray): Boolean {
+        if (head.size < 4) return false
+        fun b(i: Int): Int = head[i].toInt() and 0xFF
+        if (b(0) == 0x47 && (head.size < 189 || b(188) == 0x47)) return true
+        if (b(0) == 0x00 && b(1) == 0x00 && b(2) == 0x01 && (b(3) == 0xBA || b(3) == 0xB3)) return true
+        if (head.size >= 8) {
+            val box = String(head, 4, 4, Charsets.ISO_8859_1)
+            if (box == "ftyp" || box == "moov" || box == "moof" || box == "mdat" || box == "styp") return true
+        }
+        if (b(0) == 0x1A && b(1) == 0x45 && b(2) == 0xDF && b(3) == 0xA3) return true
+        if (b(0) == 0xFF && (b(1) and 0xF6) == 0xF0) return true
+        if (b(0) == 0xFF && (b(1) == 0xFB || b(1) == 0xF3 || b(1) == 0xF2)) return true
+        if (b(0) == 'I'.code && b(1) == 'D'.code && b(2) == '3'.code) return true
+        if (head.size >= 4 && String(head, 0, 4, Charsets.ISO_8859_1) == "OggS") return true
+        if (head.size >= 4 && String(head, 0, 4, Charsets.ISO_8859_1) == "DKIF") return true
+        if (head.size >= 3 && String(head, 0, 3, Charsets.ISO_8859_1) == "FLV") return true
+        return false
+    }
+
     private data class PlaylistCheck(
         val ok: Boolean,
         val isMaster: Boolean,
         val lines: List<String> = emptyList(),
+        val encrypted: Boolean = false,
     )
 
     private suspend fun playlistCheck(
@@ -1050,7 +1118,12 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         if (!text.startsWith("#EXTM3U")) return PlaylistCheck(false, false)
         val lines = text.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
         if (lines.isEmpty()) return PlaylistCheck(false, false)
-        return PlaylistCheck(true, text.contains("#EXT-X-STREAM-INF"), lines)
+        return PlaylistCheck(
+            ok = true,
+            isMaster = text.contains("#EXT-X-STREAM-INF"),
+            lines = lines,
+            encrypted = text.contains("#EXT-X-KEY"),
+        )
     }
 
     /**
@@ -1068,12 +1141,14 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
 
         var playlistUrl = upstream
         var segments = master.lines
+        var encrypted = master.encrypted
         if (master.isMaster) {
             val variantUrl = resolveRelativeUrl(upstream, master.lines.first())
             val variant = playlistCheck(variantUrl, headers)
             if (!variant.ok) return@runCatching false
             playlistUrl = variantUrl
             segments = variant.lines
+            encrypted = variant.encrypted
         }
 
         val segUrl = resolveRelativeUrl(playlistUrl, segments.first())
@@ -1081,8 +1156,23 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         if (seg.code != 200 && seg.code != 206) return@runCatching false
         val head = seg.body?.bytes() ?: return@runCatching false
         if (head.isEmpty()) return@runCatching false
-        !imageMagic(head)
+        if (imageMagic(head)) return@runCatching false
+        // Standard HLS encryption is handled by the player itself; any other
+        // unknown payload (custom encrypted blob) can never be decoded.
+        if (!encrypted && !looksLikeMedia(head)) return@runCatching false
+        true
     }.getOrDefault(false)
+
+    /**
+     * The scrapper proxies one site's provider API, so it only answers for a
+     * request that looks like it comes from that site.
+     */
+    private fun rivestreamHeaders(): Map<String, String> = mapOf(
+        "User-Agent" to UA,
+        "Accept" to "application/json",
+        "Referer" to "https://www.1flex.org/",
+        "Origin" to "https://www.1flex.org",
+    )
 
     private suspend fun resolveRivestreamProvider(m: MediaData, q: Int): List<ExtractorLink> {
         val url = if (m.type.equals("movie", ignoreCase = true))
@@ -1092,37 +1182,51 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             val e = m.episode ?: return emptyList()
             "https://scrapper.rivestream.app/api/provider?provider=prime&id=${m.id}&season=$s&episode=$e"
         }
-        return withTimeoutOrNull(15_000L) {
+        return withTimeoutOrNull(20_000L) {
             try {
-                val json = app.get(url, headers = httpHeaders("https://www.rivestream.app/")).text
+                val json = retrying(attempts = 4, delayMs = 900) {
+                    val body = app.get(url, headers = rivestreamHeaders()).text
+                    val parsed = runCatching { mapper.readValue(body, RivestreamResponse::class.java) }.getOrNull()
+                    parsed?.data?.sources?.takeIf { it.isNotEmpty() }?.let { body }
+                } ?: return@withTimeoutOrNull emptyList()
                 val response = mapper.readValue(json, RivestreamResponse::class.java)
                 val sources = response.data?.sources ?: return@withTimeoutOrNull emptyList()
 
-                // upstream -> (server name, quality), first quality wins per upstream
+                // The proxy url and the inner upstream are both playable
+                // candidates: the proxy carries the needed headers, the inner
+                // url works when the proxy is busy.
                 val candidates = linkedMapOf<String, Pair<String, Int>>()
                 for (src in sources) {
-                    val upstream = rivestreamUpstream(src.url ?: continue) ?: continue
+                    val raw = src.url ?: continue
                     val quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull() ?: q
-                    if (!candidates.containsKey(upstream)) {
-                        candidates[upstream] = (src.source ?: "Server") to quality
+                    val server = src.source ?: src.format ?: "Server"
+                    if (!candidates.containsKey(raw)) candidates[raw] = server to quality
+                    val upstream = rivestreamUpstream(raw)
+                    if (upstream != null && !candidates.containsKey(upstream)) {
+                        candidates[upstream] = server to quality
                     }
                 }
 
                 // Verify every playback chain before exposing it.
+                val headers = mapOf(
+                    "User-Agent" to UA,
+                    "Referer" to "https://www.1flex.org/",
+                    "Origin" to "https://www.1flex.org",
+                )
                 val candidateList: List<Pair<String, Pair<String, Int>>> = candidates.toList()
                 val verified: List<Pair<String, Pair<String, Int>>> = candidateList.amap { candidate ->
-                    if (verifyUpstreamChain(candidate.first)) listOf(candidate) else emptyList()
+                    if (verifyUpstreamChain(candidate.first, headers)) listOf(candidate) else emptyList()
                 }.flatten()
 
                 verified.map { link ->
                     val upstream = link.first
                     val server = link.second.first
                     val quality = link.second.second
-                    newExtractorLink("OneFlex", "OneFlex - $server (${quality}p)", upstream) {
+                    newExtractorLink(name, "$name - $server (${quality}p)", upstream) {
                         this.quality = quality
-                        this.referer = ""
+                        this.referer = "https://www.1flex.org/"
                         this.type = ExtractorLinkType.M3U8
-                        this.headers = mapOf("User-Agent" to UA)
+                        this.headers = headers
                     }
                 }
             } catch (_: Exception) {
@@ -1187,23 +1291,24 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
     private suspend fun fetchSiteProviders(): List<SiteProvider> {
         val origin = mainUrl.trimEnd('/')
         for (key in siteKeyCandidates()) {
-            val res = runCatching {
-                app.get(
-                    "https://api.viduki.net/embed_providers?site=$key",
-                    headers = mapOf(
-                        "User-Agent" to UA,
-                        "Accept" to "application/json",
-                        "Referer" to "$origin/",
-                        "Origin" to origin,
-                    ),
-                )
-            }.getOrNull() ?: continue
-            if (res.code != 200) continue
-            val parsed = runCatching {
-                mapper.readValue(res.text, SiteProviderList::class.java)
-            }.getOrNull() ?: continue
-            if (parsed.providers.isEmpty()) continue
-            return parsed.providers
+            val parsed = retrying(attempts = 2, delayMs = 600) {
+                val res = runCatching {
+                    app.get(
+                        "https://api.viduki.net/embed_providers?site=$key",
+                        headers = mapOf(
+                            "User-Agent" to UA,
+                            "Accept" to "application/json",
+                            "Referer" to "$origin/",
+                            "Origin" to origin,
+                        ),
+                    )
+                }.getOrNull() ?: return@retrying null
+                if (res.code != 200) return@retrying null
+                runCatching { mapper.readValue(res.text, SiteProviderList::class.java) }
+                    .getOrNull()
+                    ?.takeIf { it.providers.isNotEmpty() }
+            }
+            if (parsed != null) return parsed.providers
         }
         return emptyList()
     }
@@ -1220,48 +1325,58 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         val isMovie = media.type.equals("movie", ignoreCase = true)
         val apiUrl = if (isMovie) "https://vidrock.net/api/movie/${media.id}"
         else "https://vidrock.net/api/tv/${media.id}/${media.season ?: 1}/${media.episode ?: 1}"
-        val res = runCatching {
-            app.get(
-                apiUrl,
-                headers = mapOf(
-                    "User-Agent" to UA,
-                    "Accept" to "application/json",
-                    "Referer" to "https://vidrock.to/",
-                ),
-            )
-        }.getOrNull() ?: return emptyList()
-        if (res.code != 200) return emptyList()
+        val res = retrying(attempts = 3, delayMs = 700) {
+            val r = runCatching {
+                app.get(
+                    apiUrl,
+                    headers = mapOf(
+                        "User-Agent" to UA,
+                        "Accept" to "application/json",
+                        "Referer" to "https://vidrock.to/",
+                    ),
+                )
+            }.getOrNull() ?: return@retrying null
+            if (r.code != 200) return@retrying null
+            r
+        } ?: return emptyList()
         val servers = runCatching {
             mapper.readValue(res.text, object : TypeReference<Map<String, VidrockServer>>() {})
         }.getOrNull() ?: return emptyList()
 
-        val out = mutableListOf<ExtractorLink>()
-        for ((serverName, server) in servers) {
-            val encrypted = server.url ?: continue
-            if (encrypted.isBlank()) continue
-            val playlist = VidrockCipher.decrypt(encrypted) ?: continue
-            if (!playlist.startsWith("http")) continue
-            val headers = mapOf(
-                "User-Agent" to UA,
-                "Referer" to "https://vidrock.to/",
-                "Origin" to "https://vidrock.to",
-            )
-            if (!verifyUpstreamChain(playlist, headers)) {
-                logDiag("vidrock server $serverName not reachable")
-                continue
-            }
-            val label = serverName
-            val link = newExtractorLink(name, "$name - Vidrock $label", playlist) {
-                this.quality = Qualities.Unknown.value
-                this.referer = "https://vidrock.to/"
-                this.type = ExtractorLinkType.M3U8
-                this.headers = headers
-            }
-            out.add(link)
-            onLink.invoke(link)
-        }
-        logDiag("vidrock servers ${out.size}/${servers.size} from $apiUrl")
-        return out
+        val headers = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "https://vidrock.to/",
+            "Origin" to "https://vidrock.to",
+        )
+        val candidates = servers.entries.filter { !it.value.url.isNullOrBlank() }
+        val links = coroutineScope {
+            candidates.map { (serverName, server) ->
+                async {
+                    withTimeoutOrNull(8_000L) {
+                        try {
+                            val playlist = VidrockCipher.decrypt(server.url ?: "") ?: return@withTimeoutOrNull null
+                            if (!playlist.startsWith("http")) return@withTimeoutOrNull null
+                            if (!verifyUpstreamChain(playlist, headers)) {
+                                logDiag("vidrock server $serverName not reachable")
+                                return@withTimeoutOrNull null
+                            }
+                            newExtractorLink(name, "$name - Vidrock $serverName", playlist) {
+                                this.quality = Qualities.Unknown.value
+                                this.referer = "https://vidrock.to/"
+                                this.type = ExtractorLinkType.M3U8
+                                this.headers = headers
+                            }
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                }
+            }.awaitAll()
+        }.filterNotNull()
+
+        links.forEach { onLink.invoke(it) }
+        logDiag("vidrock servers ${links.size}/${candidates.size} from $apiUrl")
+        return links
     }
 
     /** Pulls the site's own server templates. */
@@ -1314,29 +1429,45 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         // 2. sites that hardcode their server templates in their JS bundle
         if (found.isEmpty()) {
             runCatching {
-                val page = app.get(watchPageUrl(media), headers = siteHeaders())
-                if (page.code != 200) {
-                    logDiag("site watch page ${page.code} $mainUrl")
-                    return@runCatching
-                }
-                val scripts = Regex("""<script[^>]+src=["']([^"']+)["']""")
-                    .findAll(page.text).map { it.groupValues[1] }.distinct().take(20).toList()
-                for (src in scripts) {
-                    val url = if (src.startsWith("http")) src
-                    else "${mainUrl.trimEnd('/')}/${src.trimStart('/')}"
-                    val js = runCatching { app.get(url, headers = siteHeaders()) }.getOrNull() ?: continue
-                    if (js.code != 200) continue
-                    val descriptors = extractServerDescriptors(js.text)
-                    for (template in descriptors) {
-                        val key = "${template.label}|${template.url}"
-                        if (!found.containsKey(key)) found[key] = template
+                val pages = listOf(
+                    watchPageUrl(media),
+                    "$mainUrl/",
+                    "$mainUrl/search?type=${if (isMovie) "movie" else "tv"}",
+                ).map { it.trimEnd('/').ifEmpty { mainUrl } }.distinct()
+                for (pageUrl in pages) {
+                    val page = runCatching { app.get(pageUrl, headers = siteHeaders()) }.getOrNull()
+                    if (page == null || page.code != 200) {
+                        logDiag("site page ${page?.code ?: "null"} $pageUrl")
+                        continue
                     }
-                    val descriptorUrls = descriptors.map { it.url }.toSet()
-                    for (template in extractSiteTemplates(js.text)) {
-                        if (descriptorUrls.contains(template.url)) continue
-                        if (!found.containsKey(template.url)) found[template.url] = template
+                    val scripts = Regex("""<script[^>]+src=["']([^"']+)["']""")
+                        .findAll(page.text).map { it.groupValues[1] }.distinct().take(20).toList()
+                    for (batch in scripts.chunked(6)) {
+                        val bodies = coroutineScope {
+                            batch.map { src ->
+                                async {
+                                    val url = if (src.startsWith("http")) src
+                                    else "${mainUrl.trimEnd('/')}/${src.trimStart('/')}"
+                                    runCatching { app.get(url, headers = siteHeaders()) }.getOrNull()
+                                }
+                            }.awaitAll()
+                        }
+                        for (js in bodies) {
+                            if (js == null || js.code != 200) continue
+                            val descriptors = extractServerDescriptors(js.text)
+                            for (template in descriptors) {
+                                val key = "${template.label}|${template.url}"
+                                if (!found.containsKey(key)) found[key] = template
+                            }
+                            val descriptorUrls = descriptors.map { it.url }.toSet()
+                            for (template in extractSiteTemplates(js.text)) {
+                                if (descriptorUrls.contains(template.url)) continue
+                                if (!found.containsKey(template.url)) found[template.url] = template
+                            }
+                        }
+                        if (found.size >= 8) break
                     }
-                    if (found.size >= 8) break
+                    if (found.isNotEmpty()) break
                 }
                 logDiag("site bundle scan ${found.size} templates from $mainUrl")
             }.onFailure { logDiag("site bundle scan failed: ${it.message}") }
@@ -1613,20 +1744,32 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         }
     } ?: emptyList()
 
-    private suspend fun resolveExternalFallback(media: MediaData, preferredQ: Int): List<ExtractorLink> {
+    private suspend fun resolveExternalFallback(
+        media: MediaData,
+        preferredQ: Int,
+        onLink: (ExtractorLink) -> Unit = {},
+    ): List<ExtractorLink> {
         val raw = withTimeoutOrNull(60_000L) {
-            externalProviders.amap { provider ->
-                runCatching {
-                    provider.servers.flatMap { server -> provider.resolver(media, server, preferredQ) }
-                }.getOrElse { emptyList() }
+            coroutineScope {
+                externalProviders.map { provider ->
+                    async {
+                        runCatching {
+                            provider.servers.flatMap { server ->
+                                provider.resolver(media, server, preferredQ)
+                            }
+                        }.getOrElse { emptyList() }
+                    }
+                }.awaitAll()
             }
         }?.flatten() ?: emptyList()
-        return raw.sortedBy { link ->
+        val sorted = raw.sortedBy { link ->
             if (link.quality == preferredQ) 0
             else QUALITY_ORDER.indexOf(link.quality).let { idx ->
                 if (idx == -1) Int.MAX_VALUE else idx + 1
             }
         }
+        sorted.forEach { onLink.invoke(it) }
+        return sorted
     }
 
     /** Subtitle-only vidy pass (used when playback came from external backups or cache). */
@@ -1661,9 +1804,11 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val media = runCatching { mapper.readValue(data, MediaData::class.java) }.getOrNull() ?: return false
-        val mediaIdStr = media.id.toString()
-        val referer = "https://vidy.st/"
+        val media = runCatching { mapper.readValue(data, MediaData::class.java) }.getOrNull()
+        if (media == null) {
+            logDiag("loadLinks media parse failed for $name")
+            return false
+        }
         val preferredQ = prefInt("quality", 720)
 
         // ---- Cache hit? (resolved links stay valid ~10 minutes) ----
@@ -1676,41 +1821,91 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             return true
         }
 
+        // Every tier runs at the same time: this site's own servers, the vidy
+        // city servers and the external backups. A verified link is streamed to
+        // the callback the moment it is ready, so a slow tier can never hide
+        // the links of another one.
+        val emitLock = Any()
+        val emitted = mutableListOf<ExtractorLink>()
+        fun emit(link: ExtractorLink) {
+            synchronized(emitLock) { emitted.add(link) }
+            runCatching { callback.invoke(link) }
+        }
+
+        logDiag("loadLinks start $name id=${media.id} type=${media.type} s=${media.season} e=${media.episode}")
+
+        val vidyJob = backgroundScope.async {
+            runCatching {
+                resolveVidyTier(media, preferredQ, ::emit) { sub -> subtitleCallback.invoke(sub) }
+            }.getOrDefault(emptyList())
+        }
+        val siteJob = backgroundScope.async {
+            runCatching { resolveSiteServers(media, preferredQ, ::emit) }.getOrDefault(emptyList())
+        }
+        val fallbackJob = backgroundScope.async {
+            runCatching { resolveExternalFallback(media, preferredQ, ::emit) }.getOrDefault(emptyList())
+        }
+
+        val started = System.currentTimeMillis()
+        var firstLinkAt = -1L
+        while (true) {
+            val elapsed = System.currentTimeMillis() - started
+            val count = synchronized(emitLock) { emitted.size }
+            if (count > 0 && firstLinkAt < 0) firstLinkAt = elapsed
+            if (vidyJob.isCompleted && siteJob.isCompleted && fallbackJob.isCompleted) break
+            if (count > 0 && elapsed - firstLinkAt >= 8_000L) break
+            if (elapsed >= 45_000L) break
+            delay(250)
+        }
+
+        val links = synchronized(emitLock) { emitted.toList() }
+        logDiag(
+            "loadLinks done $name links=${links.size} " +
+                "vidy=${vidyJob.isCompleted} site=${siteJob.isCompleted} fallback=${fallbackJob.isCompleted}"
+        )
+        if (links.isNotEmpty()) {
+            cachePut(cacheKey, links)
+        } else {
+            backgroundScope.launch {
+                runCatching { fetchVidySubtitlesOnly(media, subtitleCallback) }
+            }
+        }
+        return links.isNotEmpty()
+    }
+
+    /**
+     * Vidy city tier: the first city that answers exposes every quality, every
+     * other city adds one direct backup link for CDN errors.
+     */
+    private suspend fun resolveVidyTier(
+        media: MediaData,
+        preferredQ: Int,
+        onLink: (ExtractorLink) -> Unit,
+        onSubtitle: (SubtitleFile) -> Unit,
+    ): List<ExtractorLink> {
+        val referer = "https://vidy.st/"
+
         // Preferred quality first, then QUALITY_ORDER, unknowns last.
         fun rank(q: Int): Int =
             if (q == preferredQ) 0
             else QUALITY_ORDER.indexOf(q).let { idx -> if (idx == -1) Int.MAX_VALUE else idx + 1 }
 
         val seed = try {
-            app.get("$vidyApi/seed?mediaId=$mediaIdStr", headers = vidyHeaders())
+            app.get("$vidyApi/seed?mediaId=${media.id}", headers = vidyHeaders())
                 .parsed<WecollegeSeed>().seed
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
+        if (seed == null) {
+            logDiag("vidy seed unavailable")
+            return emptyList()
+        }
 
-        // Every city server: the first successful one exposes the full
-        // per-quality list (direct media playlists = fast start), every
-        // other city adds one direct fallback link for CDN errors (2004).
         val subtitles = linkedMapOf<String, SubtitleFile>()
         val links = mutableListOf<ExtractorLink>()
         var added = 0
 
-        // This site's own servers run beside vidy and stream their links out as
-        // soon as each server resolves, so they never delay the other links.
-        val siteScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val siteEmitted = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
-        val siteJob = siteScope.async {
-            runCatching {
-                resolveSiteServers(media, preferredQ) { link ->
-                    runCatching {
-                        siteEmitted.add(link)
-                        callback.invoke(link)
-                    }
-                }
-            }.getOrDefault(emptyList())
-        }
-
-        if (seed != null) withTimeoutOrNull(20_000L) {
+        if (seed != null) withTimeoutOrNull(25_000L) {
             vidyBlockedHit = false
             for (city in vidyCities) {
                 if (vidyBlockedHit) break
@@ -1724,15 +1919,15 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                     // Primary city: expose every available quality.
                     for (src in sorted) {
                         val url = src.url ?: continue
-                        links.add(
-                            newExtractorLink(name, "$name - $cityLabel ${src.quality ?: "auto"}", url) {
-                                this.quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull()
-                                    ?: Qualities.Unknown.value
-                                this.referer = referer
-                                this.type = ExtractorLinkType.M3U8
-                                this.headers = vidyHeaders()
-                            }
-                        )
+                        val link = newExtractorLink(name, "$name - $cityLabel ${src.quality ?: "auto"}", url) {
+                            this.quality = src.quality?.trimEnd('p', 'P')?.toIntOrNull()
+                                ?: Qualities.Unknown.value
+                            this.referer = referer
+                            this.type = ExtractorLinkType.M3U8
+                            this.headers = vidyHeaders()
+                        }
+                        links.add(link)
+                        onLink.invoke(link)
                     }
                     // v7 feature: the API can answer with a master playlist only.
                     // Enumerate its variants into one link per quality; if that
@@ -1748,39 +1943,39 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
                         }.getOrNull()
                         if (!variants.isNullOrEmpty()) {
                             for (v in variants) {
-                                links.add(
-                                    newExtractorLink(name, "$name - $cityLabel ${v.quality}p", v.url) {
-                                        this.quality = v.quality
-                                        this.referer = referer
-                                        this.type = ExtractorLinkType.M3U8
-                                        this.headers = vidyHeaders()
-                                    }
-                                )
-                            }
-                        } else {
-                            links.add(
-                                newExtractorLink(name, "$name - $cityLabel (Auto)", master) {
-                                    this.quality = Qualities.Unknown.value
+                                val link = newExtractorLink(name, "$name - $cityLabel ${v.quality}p", v.url) {
+                                    this.quality = v.quality
                                     this.referer = referer
                                     this.type = ExtractorLinkType.M3U8
                                     this.headers = vidyHeaders()
                                 }
-                            )
+                                links.add(link)
+                                onLink.invoke(link)
+                            }
+                        } else {
+                            val link = newExtractorLink(name, "$name - $cityLabel (Auto)", master) {
+                                this.quality = Qualities.Unknown.value
+                                this.referer = referer
+                                this.type = ExtractorLinkType.M3U8
+                                this.headers = vidyHeaders()
+                            }
+                            links.add(link)
+                            onLink.invoke(link)
                         }
                     }
                 } else {
                     // Alt cities: one direct link, preferred quality first.
                     val alt = sorted.firstOrNull() ?: continue
                     val url = alt.url ?: continue
-                    links.add(
-                        newExtractorLink(name, "$name - $cityLabel (Alt)", url) {
-                            this.quality = alt.quality?.trimEnd('p', 'P')?.toIntOrNull()
-                                ?: Qualities.Unknown.value
-                            this.referer = referer
-                            this.type = ExtractorLinkType.M3U8
-                            this.headers = vidyHeaders()
-                        }
-                    )
+                    val link = newExtractorLink(name, "$name - $cityLabel (Alt)", url) {
+                        this.quality = alt.quality?.trimEnd('p', 'P')?.toIntOrNull()
+                            ?: Qualities.Unknown.value
+                        this.referer = referer
+                        this.type = ExtractorLinkType.M3U8
+                        this.headers = vidyHeaders()
+                    }
+                    links.add(link)
+                    onLink.invoke(link)
                 }
                 added++
 
@@ -1793,47 +1988,9 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
             }
         }
 
-        // ---- Tier 0: this site's own servers (site catalog / bundle) ----
-        // Their links were already handed to the callback as they resolved, so
-        // they are only collected here when nothing else was found.
-        val siteLinks = try {
-            if (links.isEmpty()) {
-                withTimeoutOrNull(20_000L) { siteJob.await() }.orEmpty()
-            } else {
-                emptyList()
-            }
-        } finally {
-            if (links.isEmpty()) runCatching { siteScope.cancel() }
-        }
-        if (siteLinks.isNotEmpty()) {
-            logDiag("loadLinks tier0 site servers -> ${siteLinks.size}")
-        }
-
-        // ---- Tier 2: external backup resolvers when vidy fails ----
-        if (links.isEmpty()) {
-            links.addAll(resolveExternalFallback(media, preferredQ))
-            logDiag("loadLinks tier2 external -> ${links.size}")
-            if (links.isNotEmpty()) {
-                backgroundScope.launch {
-                    runCatching { fetchVidySubtitlesOnly(media, subtitleCallback) }
-                }
-            }
-        }
-
         // ---- Subtitles in background (never delay video start) ----
-        if (subtitles.isNotEmpty()) {
-            val subs = subtitles.values.toList()
-            backgroundScope.launch {
-                subs.forEach { subtitleCallback.invoke(it) }
-            }
-        }
-
-        if (links.isNotEmpty()) {
-            links.forEach { callback.invoke(it) }
-            cachePut(cacheKey, links)
-        }
-
-        return links.isNotEmpty() || siteEmitted.isNotEmpty()
+        subtitles.values.forEach { onSubtitle.invoke(it) }
+        return links
     }
 }
 
