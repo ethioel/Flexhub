@@ -648,9 +648,10 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
 
     /** Mirror hosts of the vidsrc family; one blocked host must not kill the tier. */
     private val vidsrcHosts = listOf(
-        "https://vsembed.ru",
         "https://vidsrc.me",
         "https://vidsrc.sh",
+        "https://vsembed.ru",
+        "https://vidsrc.app",
     )
 
     /** Retries flaky upstreams: several of them fail intermittently. */
@@ -667,11 +668,17 @@ open class FlexhubFamilyProvider(override var name: String, override var mainUrl
         return null
     }
 
-    /** Tries every mirror host in parallel, the first one that answers wins. */
-    private suspend fun resolveVsembedAny(m: MediaData, q: Int): List<ExtractorLink> = coroutineScope {
-        vidsrcHosts.map { base ->
-            async { runCatching { resolveVsembed(m, q, base, "Vsembed") }.getOrDefault(emptyList()) }
-        }.awaitAll().firstOrNull { it.isNotEmpty() } ?: emptyList()
+    /**
+     * Tries the mirror hosts one after the other: they share one backend that
+     * rate limits per client, so hammering them in parallel would make every
+     * request fail with "unavailable".
+     */
+    private suspend fun resolveVsembedAny(m: MediaData, q: Int): List<ExtractorLink> {
+        for (base in vidsrcHosts) {
+            val links = runCatching { resolveVsembed(m, q, base, "Vsembed") }.getOrDefault(emptyList())
+            if (links.isNotEmpty()) return links
+        }
+        return emptyList()
     }
 
 
